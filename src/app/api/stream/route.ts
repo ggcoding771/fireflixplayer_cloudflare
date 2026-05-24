@@ -280,8 +280,11 @@ async function fetchMissouriMonster(
       let qualities: QualityLevel[] = [];
       let subtitles: StreamResult['subtitles'] = [];
 
+      // Fetch m3u8 through HF proxy to avoid CF Worker header blocking
+      // On Cloudflare, direct fetch() adds Cdn-Loop/Cf-Worker headers that CDNs reject
       try {
-        const m3u8Response = await fetch(data.url, { signal: AbortSignal.timeout(10000) });
+        const m3u8ProxyUrl = `${HF_PROXY_BASE}/proxy?url=${encodeURIComponent(data.url)}&referer=${encodeURIComponent('https://net52.cc/')}&origin=${encodeURIComponent('https://net52.cc')}`;
+        const m3u8Response = await fetch(m3u8ProxyUrl, { signal: AbortSignal.timeout(10000) });
         if (m3u8Response.ok) {
           const m3u8Content = await m3u8Response.text();
           if (m3u8Content.includes('#EXTM3U')) {
@@ -316,7 +319,7 @@ async function fetchMissouriMonster(
               const langCode = s.language || detectLanguageFromLabel(s.label);
               return {
                 label: s.label,
-                url: s.file,
+                url: buildProxyUrl(s.file),
                 type: (s.type === 'srt' ? 'srt' : 'vtt') as 'vtt' | 'srt' | 'ass',
                 language: langCode,
                 flagEmoji: getFlagForLangCode(langCode),
@@ -327,18 +330,22 @@ async function fetchMissouriMonster(
         // subtitle fetch failed, continue without
       }
 
+      // Wrap URL through our /api/proxy — on Cloudflare Pages, the browser
+      // cannot load CDN URLs directly (CORS/Referer/CF header issues)
+      const playableUrl = buildProxyUrl(data.url);
+
       return {
         sourceId: `mm-${sourceKey}`,
         sourceName: data.source || sourceKey,
         success: true,
-        url: data.url,
-        rawUrl: data.raw_url,
+        url: playableUrl,
+        rawUrl: data.url,
         audioTracks,
         qualities,
         languageFlags: generateFlagsFromLangs(audioTracks.map(t => t.language)),
         elapsedMs,
         error: null,
-        needsProxy: false,
+        needsProxy: true,
         subtitles: subtitles && subtitles.length > 0 ? subtitles : undefined,
       };
     }
@@ -477,12 +484,12 @@ async function fetchStreamForge(
           if (r.headers) Object.assign(resultHeaders, r.headers);
 
           try {
-            const fetchHeaders: Record<string, string> = {};
-            if (resultHeaders.Referer) fetchHeaders['Referer'] = resultHeaders.Referer;
-            if (resultHeaders['User-Agent']) fetchHeaders['User-Agent'] = resultHeaders['User-Agent'];
+            // Route through HF proxy to avoid CF Worker header blocking
+            const m3u8Referer = resultHeaders.Referer || 'https://net52.cc/';
+            const m3u8Origin = resultHeaders.Origin || 'https://net52.cc';
+            const m3u8ProxyUrl = `${HF_PROXY_BASE}/proxy?url=${encodeURIComponent(resultUrl)}&referer=${encodeURIComponent(m3u8Referer)}&origin=${encodeURIComponent(m3u8Origin)}`;
 
-            const m3u8Response = await fetch(resultUrl, {
-              headers: Object.keys(fetchHeaders).length > 0 ? fetchHeaders : undefined,
+            const m3u8Response = await fetch(m3u8ProxyUrl, {
               signal: AbortSignal.timeout(10000),
             });
             if (m3u8Response.ok) {
@@ -534,12 +541,12 @@ async function fetchStreamForge(
       } else {
         // ── Non-NetMirror: Parse only primary m3u8 ──
         try {
-          const fetchHeaders: Record<string, string> = {};
-          if (headers.Referer) fetchHeaders['Referer'] = headers.Referer;
-          if (headers['User-Agent']) fetchHeaders['User-Agent'] = headers['User-Agent'];
+          // Route through HF proxy to avoid CF Worker header blocking
+          const m3u8Referer = headers.Referer || 'https://net52.cc/';
+          const m3u8Origin = headers.Origin || 'https://net52.cc';
+          const m3u8ProxyUrl = `${HF_PROXY_BASE}/proxy?url=${encodeURIComponent(primaryUrl)}&referer=${encodeURIComponent(m3u8Referer)}&origin=${encodeURIComponent(m3u8Origin)}`;
 
-          const m3u8Response = await fetch(primaryUrl, {
-            headers: Object.keys(fetchHeaders).length > 0 ? fetchHeaders : undefined,
+          const m3u8Response = await fetch(m3u8ProxyUrl, {
             signal: AbortSignal.timeout(10000),
           });
           if (m3u8Response.ok) {
@@ -930,16 +937,28 @@ export async function GET(request: NextRequest) {
   ])
 
   // Merge sources — StreamForge FIRST, then missourimonster
+  // IMPORTANT: Wrap MM source URLs with /api/proxy — on Cloudflare Pages,
+  // the browser cannot load CDN URLs directly (CORS/Referer/CF header issues)
   const mmSources: StreamSource[] = (mmData?.sources || []).map((s: StreamSource) => ({
     ...s,
+    url: s.url && !s.url.startsWith('/api/proxy') ? buildProxyUrl(s.url) : s.url,
     language: s.language || undefined,
     quality: s.quality || undefined,
   }))
 
   const sfSources: StreamSource[] = sfData?.sources || []
+  // Wrap subtitle file URLs with /api/proxy for CORS/proxy support
+  const mmSubtitles: StreamSubtitle[] = (mmData?.subtitles || []).map((s: StreamSubtitle) => ({
+    ...s,
+    file: s.file && !s.file.startsWith('/api/proxy') ? buildProxyUrl(s.file) : s.file,
+  }))
+  const sfSubtitles: StreamSubtitle[] = (sfData?.subtitles || []).map((s: StreamSubtitle) => ({
+    ...s,
+    file: s.file && !s.file.startsWith('/api/proxy') ? buildProxyUrl(s.file) : s.file,
+  }))
   const subtitles: StreamSubtitle[] = [
-    ...(mmData?.subtitles || []),
-    ...(sfData?.subtitles || []),
+    ...mmSubtitles,
+    ...sfSubtitles,
   ]
 
   // Deduplicate subtitles

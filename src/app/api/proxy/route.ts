@@ -10,16 +10,15 @@ import { NextRequest, NextResponse } from 'next/server';
 // HuggingFace Spaces (not Cloudflare) and doesn't add these headers.
 //
 // ROUTING STRATEGY:
-// 1. m3u8 playlists → HF proxy (which rewrites all URLs to go through itself)
-//    - The HF proxy returns m3u8 with relative URLs like /proxy?url=...
-//    - Browser resolves these to https://epiccodergg-fireflix-api.hf.space/proxy?url=...
-//    - This means segments go DIRECTLY through HF (free bandwidth, no CF headers)
-//    - We pass through the m3u8 as-is from HF (no need to rewrite)
+// 1. ALL requests go through HF proxy to avoid CF header blocking
+// 2. For m3u8 playlists: fetch through HF proxy, then REWRITE all URLs
+//    in the m3u8 to go through our /api/proxy (not HF proxy's relative URLs)
+// 3. For segments: fetch through HF proxy and stream through
+// 4. For subtitles: fetch through HF proxy and return
 //
-// 2. Video/audio segments → fetched directly from HF proxy by the browser
-//    - Our proxy is NOT in the path for segments (HF handles them directly)
-//
-// 3. For non-m3u8 content (subtitles, etc.) → proxy through HF and return
+// KEY FIX: The HF proxy rewrites m3u8 URLs to relative paths like /proxy?url=...
+// When served from our /api/proxy, these resolve to fireflixplayer.pages.dev/proxy
+// which doesn't exist. We must rewrite them to /api/proxy?url=...
 
 const HF_PROXY_BASE = 'https://epiccodergg-fireflix-api.hf.space';
 
@@ -32,21 +31,13 @@ export async function GET(request: NextRequest) {
   }
 
   try {
-    // ─── Route through HF proxy to avoid CF header blocking ────────────
-    const referer = searchParams.get('referer') || '';
-    const origin = searchParams.get('origin') || '';
-
-    // Use net52.cc as default Referer/Origin for NetMirror/castle CDNs
-    const netMirrorOrigin = 'https://net52.cc';
-    const netMirrorReferer = 'https://net52.cc/';
-
-    const effectiveReferer = referer || netMirrorReferer;
-    const effectiveOrigin = origin || netMirrorOrigin;
+    const referer = searchParams.get('referer') || 'https://net52.cc/';
+    const origin = searchParams.get('origin') || 'https://net52.cc';
 
     // Build HF proxy URL
     let hfProxyUrl = `${HF_PROXY_BASE}/proxy?url=${encodeURIComponent(targetUrl)}`;
-    hfProxyUrl += `&referer=${encodeURIComponent(effectiveReferer)}`;
-    hfProxyUrl += `&origin=${encodeURIComponent(effectiveOrigin)}`;
+    hfProxyUrl += `&referer=${encodeURIComponent(referer)}`;
+    hfProxyUrl += `&origin=${encodeURIComponent(origin)}`;
 
     // Forward the request to HF proxy
     const response = await fetch(hfProxyUrl, {
@@ -58,6 +49,7 @@ export async function GET(request: NextRequest) {
     });
 
     if (!response.ok) {
+      console.error(`[Proxy] HF proxy returned ${response.status} for ${targetUrl}`);
       return NextResponse.json(
         { error: `Upstream returned ${response.status}` },
         { status: response.status }
@@ -70,13 +62,17 @@ export async function GET(request: NextRequest) {
     const isPlaylist = isM3U8Content(targetUrl, contentType);
 
     if (isPlaylist) {
-      // Pass through the HF proxy's m3u8 as-is.
-      // The HF proxy already rewrites all segment URLs to go through itself
-      // (relative URLs like /proxy?url=... resolve to the HF domain in the browser).
-      // This means segments flow through HF directly — no CF header issues!
       const body = await response.text();
 
-      return new NextResponse(body, {
+      // ─── CRITICAL: Rewrite m3u8 URLs ────────────────────────────────────
+      // The HF proxy returns m3u8 with URLs pointing to itself (relative or absolute).
+      // We must rewrite ALL URLs to go through our /api/proxy so that:
+      // - Sub-playlists get further rewriting
+      // - Segments get proxied through HF (avoiding CF headers)
+      // - Subtitles get CORS headers
+      const rewritten = rewriteM3U8(body, targetUrl, referer, origin);
+
+      return new NextResponse(rewritten, {
         status: 200,
         headers: {
           'Content-Type': 'application/vnd.apple.mpegurl',
@@ -102,6 +98,10 @@ export async function GET(request: NextRequest) {
         responseContentType = 'video/mp2t';
       } else if (targetUrl.includes('.mp4') && !targetUrl.includes('.m3u8')) {
         responseContentType = 'video/mp4';
+      } else if (targetUrl.includes('.vtt')) {
+        responseContentType = 'text/vtt';
+      } else if (targetUrl.includes('.srt')) {
+        responseContentType = 'text/plain';
       }
 
       const contentLength = response.headers.get('content-length');
@@ -126,11 +126,124 @@ export async function GET(request: NextRequest) {
       });
     }
   } catch (err) {
+    console.error(`[Proxy] Error fetching ${targetUrl}:`, err);
     return NextResponse.json(
       { error: err instanceof Error ? err.message : 'Proxy fetch failed' },
       { status: 502 }
     );
   }
+}
+
+// ─── m3u8 Rewriting ────────────────────────────────────────────────────────
+
+/**
+ * Rewrite all URLs in an m3u8 playlist to go through our /api/proxy.
+ * Handles:
+ * - Absolute HF proxy URLs: https://epiccodergg-fireflix-api.hf.space/proxy?url=...
+ * - Relative HF proxy URLs: /proxy?url=...
+ * - Absolute CDN URLs: https://cdn.example.com/...
+ * - Relative URLs: segment.ts, subdir/playlist.m3u8, etc.
+ */
+function rewriteM3U8(content: string, baseUrl: string, referer: string, origin: string): string {
+  const lines = content.split('\n');
+  const result: string[] = [];
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+
+    if (trimmed.startsWith('#EXT-X-KEY:') || trimmed.startsWith('#EXT-X-MAP:')) {
+      // Tags with URI= attribute (encryption keys, init segments)
+      result.push(rewriteUriAttribute(line, baseUrl, referer, origin));
+    } else if (trimmed.startsWith('#EXT-X-MEDIA:')) {
+      // Audio/subtitle media tags with URI attribute
+      result.push(rewriteUriAttribute(line, baseUrl, referer, origin));
+    } else if (trimmed.startsWith('#')) {
+      // Other tags — pass through
+      result.push(line);
+    } else if (trimmed === '') {
+      result.push(line);
+    } else {
+      // URL line (segment, sub-playlist, etc.)
+      result.push(rewriteUrl(trimmed, baseUrl, referer, origin));
+    }
+  }
+
+  return result.join('\n');
+}
+
+/**
+ * Rewrite URI="..." attributes in m3u8 tags
+ */
+function rewriteUriAttribute(line: string, baseUrl: string, referer: string, origin: string): string {
+  return line.replace(/URI="([^"]+)"/g, (match, url) => {
+    const rewritten = rewriteUrl(url, baseUrl, referer, origin);
+    return `URI="${rewritten}"`;
+  });
+}
+
+/**
+ * Rewrite a single URL to go through our /api/proxy
+ */
+function rewriteUrl(url: string, baseUrl: string, referer: string, origin: string): string {
+  // Case 1: Absolute HF proxy URL
+  // https://epiccodergg-fireflix-api.hf.space/proxy?url=...&referer=...&origin=...
+  if (url.startsWith(HF_PROXY_BASE + '/proxy')) {
+    try {
+      const urlObj = new URL(url);
+      const originalUrl = urlObj.searchParams.get('url');
+      const hfReferer = urlObj.searchParams.get('referer') || referer;
+      const hfOrigin = urlObj.searchParams.get('origin') || origin;
+      if (originalUrl) {
+        return buildLocalProxyUrl(originalUrl, hfReferer, hfOrigin);
+      }
+    } catch {
+      // Fall through
+    }
+  }
+
+  // Case 2: Relative HF proxy URL
+  // /proxy?url=...&referer=...&origin=...
+  if (url.startsWith('/proxy?') || url.startsWith('/proxy/')) {
+    try {
+      const urlObj = new URL(url, HF_PROXY_BASE);
+      const originalUrl = urlObj.searchParams.get('url');
+      const hfReferer = urlObj.searchParams.get('referer') || referer;
+      const hfOrigin = urlObj.searchParams.get('origin') || origin;
+      if (originalUrl) {
+        return buildLocalProxyUrl(originalUrl, hfReferer, hfOrigin);
+      }
+    } catch {
+      // Fall through
+    }
+  }
+
+  // Case 3: Absolute CDN URL (http:// or https://)
+  if (url.startsWith('http://') || url.startsWith('https://')) {
+    // Determine the appropriate referer/origin based on the CDN
+    const effectiveReferer = referer;
+    const effectiveOrigin = origin;
+    return buildLocalProxyUrl(url, effectiveReferer, effectiveOrigin);
+  }
+
+  // Case 4: Relative URL — resolve against the base URL (the m3u8's URL)
+  try {
+    const resolved = new URL(url, baseUrl).href;
+    return buildLocalProxyUrl(resolved, referer, origin);
+  } catch {
+    // Can't resolve, return as-is
+    console.warn(`[Proxy] Could not resolve relative URL: ${url} against ${baseUrl}`);
+    return url;
+  }
+}
+
+/**
+ * Build a local proxy URL: /api/proxy?url=...&referer=...&origin=...
+ */
+function buildLocalProxyUrl(url: string, referer: string, origin: string): string {
+  const params = new URLSearchParams({ url });
+  if (referer) params.set('referer', referer);
+  if (origin) params.set('origin', origin);
+  return `/api/proxy?${params.toString()}`;
 }
 
 /**
