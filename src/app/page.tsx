@@ -117,19 +117,29 @@ function EmbedModePlayer({
           return;
         }
 
-        // Sort sources by priority (same order as the reference)
+        // Sort sources by priority: Moon(netmirror) → Castle → Atlas(vidrock) → Lyra(cinesu) → rest
+        // Uses prefix matching so "netmirror_netflix" matches "netmirror", etc.
         const sorted = [...data.sources].sort((a, b) => {
           const priorityOrder = [
-            'showbox', 'cinesu', 'popr', 'vidnest', 'dooflix', 'castle',
-            'movieboxhindi', 'vidrock', 'videasy', 'netmirror', 'allmovieland',
-            'cinezo', 'vidlink', 'vidzee', 'flixhq', 'icefy', 'vidfun',
-            'meowtv', 'vidking', 'vixsrc',
+            'netmirror', 'castle', 'vidrock', 'cinesu',
+            'dooflix', 'movieboxhindi', 'vidnest', 'allmovieland',
+            'videasy', 'vidlink', 'flixhq', 'icefy',
+            'meowtv', 'cinezo', 'vidzee', 'vidfun',
+            'showbox', 'popr', 'vidking', 'vixsrc',
           ];
-          const aIdx = priorityOrder.indexOf(a.source);
-          const bIdx = priorityOrder.indexOf(b.source);
-          const aPrio = aIdx === -1 ? 999 : aIdx;
-          const bPrio = bIdx === -1 ? 999 : bIdx;
-          return aPrio - bPrio;
+          const getPriority = (source: string) => {
+            // Exact match first
+            const exact = priorityOrder.indexOf(source);
+            if (exact !== -1) return exact;
+            // Prefix match: "netmirror_netflix" matches "netmirror"
+            for (let i = 0; i < priorityOrder.length; i++) {
+              if (source.startsWith(priorityOrder[i] + '_') || source.startsWith(priorityOrder[i])) {
+                return i;
+              }
+            }
+            return 999;
+          };
+          return getPriority(a.source) - getPriority(b.source);
         });
 
         setStreamData(data);
