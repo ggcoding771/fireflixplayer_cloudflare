@@ -99,6 +99,13 @@ function buildCacheKey(type: string, id: string, season?: string, episode?: stri
 }
 
 function buildProxyUrl(directUrl: string, headers?: Record<string, string>): string {
+  // Castle CDN URLs are behind Cloudflare and CANNOT be fetched by CF Workers
+  // (Cdn-Loop header causes 403). Return the HF proxy URL directly so the
+  // browser fetches from HF proxy (not through CF Worker).
+  if (isCastleCDN(directUrl)) {
+    return buildHFProxyUrl(directUrl, headers);
+  }
+
   const params = new URLSearchParams({ url: directUrl });
   if (headers?.Referer) params.set('referer', headers.Referer);
   if (headers?.Origin) params.set('origin', headers.Origin);
@@ -109,6 +116,25 @@ function buildProxyUrl(directUrl: string, headers?: Record<string, string>): str
     } catch { /* ignore */ }
   }
   return `/api/proxy?${params.toString()}`;
+}
+
+/**
+ * Check if a URL points to a Castle CDN (behind Cloudflare).
+ * These CDNs block CF Worker requests due to Cdn-Loop detection.
+ */
+function isCastleCDN(url: string): boolean {
+  try {
+    const urlObj = new URL(url);
+    const hostname = urlObj.hostname.toLowerCase();
+    const pathname = urlObj.pathname.toLowerCase();
+    // Castle CDN pattern: img1.*.com with /myhls_mps/ path
+    if (/^img\d+\..+\.com$/.test(hostname) && pathname.includes('/myhls_mps/')) {
+      return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -280,16 +306,20 @@ async function fetchMissouriMonster(
       let qualities: QualityLevel[] = [];
       let subtitles: StreamResult['subtitles'] = [];
 
-      // Fetch m3u8 directly (like Vercel version) — Castle CDNs work with direct fetch
-      // If direct fails, the proxy will fallback to HF proxy automatically
+      // Fetch m3u8 — Castle CDNs need HF proxy (CF Worker blocked by Cdn-Loop)
       try {
-        const m3u8Response = await fetch(data.url, {
-          headers: {
-            'Referer': 'https://net52.cc/',
-            'Origin': 'https://net52.cc',
-          },
-          signal: AbortSignal.timeout(10000),
-        });
+        let m3u8Response: Response;
+        if (isCastleCDN(data.url)) {
+          // Route through HF proxy for Castle CDNs (behind CF, blocks CF Workers)
+          const m3u8ProxyUrl = `${HF_PROXY_BASE}/proxy?url=${encodeURIComponent(data.url)}&referer=${encodeURIComponent('https://net52.cc/')}&origin=${encodeURIComponent('https://net52.cc')}`;
+          m3u8Response = await fetch(m3u8ProxyUrl, { signal: AbortSignal.timeout(10000) });
+        } else {
+          // Direct fetch for non-Castle CDNs
+          m3u8Response = await fetch(data.url, {
+            headers: { 'Referer': 'https://net52.cc/', 'Origin': 'https://net52.cc' },
+            signal: AbortSignal.timeout(10000),
+          });
+        }
         if (m3u8Response.ok) {
           const m3u8Content = await m3u8Response.text();
           if (m3u8Content.includes('#EXTM3U')) {

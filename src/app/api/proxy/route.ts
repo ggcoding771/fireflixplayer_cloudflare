@@ -36,6 +36,35 @@ function isFreecdnCDN(url: string): boolean {
   }
 }
 
+/**
+ * Check if a URL points to a Castle CDN.
+ * Castle CDNs are behind Cloudflare and block CF Worker requests.
+ * They use domains like img1.klwoc.com, img1.sxwoe.com, img1.toxcw.com, etc.
+ * Pattern: img1.*.com with /myhls_mps/ path
+ */
+function isCastleCDN(url: string): boolean {
+  try {
+    const urlObj = new URL(url);
+    const hostname = urlObj.hostname.toLowerCase();
+    const pathname = urlObj.pathname.toLowerCase();
+    // Castle CDN pattern: img1.*.com with /myhls_mps/ path
+    if (/^img\d+\..+\.com$/.test(hostname) && pathname.includes('/myhls_mps/')) {
+      return true;
+    }
+    // Also match subscdn.top (subtitle CDN, also behind CF)
+    if (hostname.includes('subscdn.top')) {
+      return true;
+    }
+    // Also match imgcdn.kim (NetMirror CDN, behind CF)
+    if (hostname.includes('imgcdn.kim')) {
+      return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 export async function GET(request: NextRequest) {
   const searchParams = request.nextUrl.searchParams;
   const targetUrl = searchParams.get('url');
@@ -48,10 +77,12 @@ export async function GET(request: NextRequest) {
     const referer = searchParams.get('referer') || 'https://net52.cc/';
     const origin = searchParams.get('origin') || 'https://net52.cc';
 
-    // ─── Route through HF proxy ONLY for freecdn URLs ────────────────────
-    // freecdn*.top CDNs check Origin header and reject cross-origin browser requests.
-    // HF proxy (server-side) doesn't send problematic Origin → CDN allows it.
-    if (isFreecdnCDN(targetUrl)) {
+    // ─── Route through HF proxy for CDNs behind Cloudflare ───────────────
+    // CDNs behind Cloudflare (freecdn*.top, Castle CDNs like klwoc.com, etc.)
+    // block CF Worker requests because CF adds Cdn-Loop header to ALL fetch() calls.
+    // When a CF Worker fetches another CF-proxied domain, the loop is detected
+    // and the request is blocked (403). The HF proxy (not on CF) avoids this.
+    if (isFreecdnCDN(targetUrl) || isCastleCDN(targetUrl)) {
       return await fetchThroughHFProxy(targetUrl, referer, origin);
     }
 
@@ -225,25 +256,54 @@ async function fetchThroughHFProxy(targetUrl: string, referer: string, origin: s
 // ─── m3u8 Rewriting (Vercel-style hybrid) ──────────────────────────────────
 
 /**
- * Rewrite m3u8 with hybrid routing (matches Vercel version):
+ * Rewrite m3u8 with hybrid routing adapted for Cloudflare:
  * - freecdn*.top URLs → HF proxy (bypasses Origin-header hotlink protection)
- * - Sub-playlists → local proxy (for URL rewriting + Referer)
+ * - Castle CDN URLs (img1.*.com/myhls_mps/) → HF proxy (CF loop detection)
+ * - imgcdn.kim / subscdn.top → HF proxy (behind CF)
+ * - Sub-playlists on other CDNs → local proxy (for URL rewriting)
  * - Subtitle segments → local proxy (CORS)
- * - Video segments on non-freecdn CDNs → direct URLs or local proxy (HEAD test)
+ * - Video segments on open CDNs → direct URLs or local proxy (HEAD test)
  */
 async function rewriteM3U8(content: string, baseUrl: string, referer: string, origin: string): Promise<string> {
   const lines = content.split('\n');
   const localProxyBase = '/api/proxy';
 
-  // ─── Detect if any freecdn URLs exist in this playlist ────────────────
-  let hasFreecdnUrls = false;
+  // ─── Check if this m3u8 comes from a CF-blocked CDN ──────────────────
+  // If so, ALL URLs in it should go through HF proxy (the m3u8 itself was
+  // fetched through HF proxy, so relative URLs already point to HF)
+  const isFromCFBlockedCDN = isFreecdnCDN(baseUrl) || isCastleCDN(baseUrl);
+
+  if (isFromCFBlockedCDN) {
+    // All URLs in this m3u8 point to the same CDN family, route through HF proxy
+    return lines.map(line => {
+      const trimmed = line.trim();
+      if (trimmed === '') return line;
+
+      // Handle URI= attributes
+      if (trimmed.startsWith('#') && trimmed.includes('URI="')) {
+        return trimmed.replace(/URI="([^"]+)"/g, (_match, uri: string) => {
+          const resolved = resolveUrl(uri, baseUrl);
+          return `URI="${buildHFProxyUrl(resolved, referer, origin)}"`;
+        });
+      }
+
+      if (trimmed.startsWith('#')) return line;
+
+      // URL line — route through HF proxy
+      const resolved = resolveUrl(trimmed, baseUrl);
+      return buildHFProxyUrl(resolved, referer, origin);
+    }).join('\n');
+  }
+
+  // ─── Non-CF-blocked CDN m3u8 — hybrid routing ────────────────────────
+  let hasCFBlockedUrls = false;
   for (const line of lines) {
     const trimmed = line.trim();
     if (trimmed === '' || trimmed.startsWith('#')) continue;
 
     const resolved = resolveUrl(trimmed, baseUrl);
-    if (isFreecdnCDN(resolved)) {
-      hasFreecdnUrls = true;
+    if (isFreecdnCDN(resolved) || isCastleCDN(resolved)) {
+      hasCFBlockedUrls = true;
       break;
     }
 
@@ -252,17 +312,17 @@ async function rewriteM3U8(content: string, baseUrl: string, referer: string, or
       const uriMatch = trimmed.match(/URI="([^"]+)"/);
       if (uriMatch) {
         const uriResolved = resolveUrl(uriMatch[1], baseUrl);
-        if (isFreecdnCDN(uriResolved)) {
-          hasFreecdnUrls = true;
+        if (isFreecdnCDN(uriResolved) || isCastleCDN(uriResolved)) {
+          hasCFBlockedUrls = true;
           break;
         }
       }
     }
   }
 
-  // For non-freecdn CDNs with Referer, test if segments need proxy
+  // For non-CF-blocked CDNs with Referer, test if segments need proxy
   let segmentNeedsProxy = false;
-  if (referer && !hasFreecdnUrls) {
+  if (referer && !hasCFBlockedUrls) {
     for (const line of lines) {
       const trimmed = line.trim();
       if (trimmed === '' || trimmed.startsWith('#')) continue;
@@ -307,12 +367,12 @@ async function rewriteM3U8(content: string, baseUrl: string, referer: string, or
           const resolved = resolveUrl(uri, baseUrl);
 
           // EXT-X-MAP init segments on non-proxied CDNs → direct
-          if (trimmed.includes('#EXT-X-MAP') && !segmentNeedsProxy && !isFreecdnCDN(resolved)) {
+          if (trimmed.includes('#EXT-X-MAP') && !segmentNeedsProxy && !isFreecdnCDN(resolved) && !isCastleCDN(resolved)) {
             return `URI="${resolved}"`;
           }
 
-          // freecdn URLs → HF proxy
-          if (isFreecdnCDN(resolved)) {
+          // CF-blocked CDNs (freecdn, Castle, imgcdn.kim, subscdn) → HF proxy
+          if (isFreecdnCDN(resolved) || isCastleCDN(resolved)) {
             return `URI="${buildHFProxyUrl(resolved, referer, origin)}"`;
           }
 
@@ -326,8 +386,8 @@ async function rewriteM3U8(content: string, baseUrl: string, referer: string, or
     // ─── URL line ─────────────────────────────────────────────────────
     const resolved = resolveUrl(trimmed, baseUrl);
 
-    // freecdn URLs → HF proxy
-    if (isFreecdnCDN(resolved)) {
+    // CF-blocked CDNs (freecdn, Castle) → HF proxy
+    if (isFreecdnCDN(resolved) || isCastleCDN(resolved)) {
       return buildHFProxyUrl(resolved, referer, origin);
     }
 
