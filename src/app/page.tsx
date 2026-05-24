@@ -85,13 +85,10 @@ function EmbedModePlayer({
   useEffect(() => { currentSourceIndexRef.current = currentSourceIndex }, [currentSourceIndex]);
   useEffect(() => { failedSourcesRef.current = failedSources }, [failedSources]);
 
-  // ─── Fetch stream data with retry for network hiccups ────────────────────────
+  // ─── Fetch stream data ────────────────────────────────────────────────────
   useEffect(() => {
     if (!tmdbId) return;
     let cancelled = false;
-    let retryCount = 0;
-    const MAX_RETRIES = 3;
-    const RETRY_DELAYS = [2000, 4000, 8000]; // exponential backoff
 
     const fetchStreams = async () => {
       setLoading(true);
@@ -115,44 +112,24 @@ function EmbedModePlayer({
         if (cancelled) return;
 
         if (!data.sources || data.sources.length === 0) {
-          // No sources — retry with backoff before giving up
-          if (retryCount < MAX_RETRIES) {
-            const delay = RETRY_DELAYS[retryCount];
-            retryCount++;
-            console.log(`[EmbedPlayer] No sources, retry ${retryCount}/${MAX_RETRIES} in ${delay}ms`);
-            setLoading(true);
-            await new Promise(r => setTimeout(r, delay));
-            if (!cancelled) fetchStreams();
-            return;
-          }
           setError('No streams available for this content');
           setLoading(false);
           return;
         }
 
-        // Sort sources by priority: Moon(netmirror) → Castle → Atlas(vidrock) → Lyra(cinesu) → rest
-        // Uses prefix matching so "netmirror_netflix" matches "netmirror", etc.
+        // Sort sources by priority (same order as the reference)
         const sorted = [...data.sources].sort((a, b) => {
           const priorityOrder = [
-            'netmirror', 'castle', 'vidrock', 'cinesu',
-            'dooflix', 'movieboxhindi', 'vidnest', 'allmovieland',
-            'videasy', 'vidlink', 'flixhq', 'icefy',
-            'meowtv', 'cinezo', 'vidzee', 'vidfun',
-            'showbox', 'popr', 'vidking', 'vixsrc',
+            'showbox', 'cinesu', 'popr', 'vidnest', 'dooflix', 'castle',
+            'movieboxhindi', 'vidrock', 'videasy', 'netmirror', 'allmovieland',
+            'cinezo', 'vidlink', 'vidzee', 'flixhq', 'icefy', 'vidfun',
+            'meowtv', 'vidking', 'vixsrc',
           ];
-          const getPriority = (source: string) => {
-            // Exact match first
-            const exact = priorityOrder.indexOf(source);
-            if (exact !== -1) return exact;
-            // Prefix match: "netmirror_netflix" matches "netmirror"
-            for (let i = 0; i < priorityOrder.length; i++) {
-              if (source.startsWith(priorityOrder[i] + '_') || source.startsWith(priorityOrder[i])) {
-                return i;
-              }
-            }
-            return 999;
-          };
-          return getPriority(a.source) - getPriority(b.source);
+          const aIdx = priorityOrder.indexOf(a.source);
+          const bIdx = priorityOrder.indexOf(b.source);
+          const aPrio = aIdx === -1 ? 999 : aIdx;
+          const bPrio = bIdx === -1 ? 999 : bIdx;
+          return aPrio - bPrio;
         });
 
         setStreamData(data);
@@ -163,17 +140,7 @@ function EmbedModePlayer({
       } catch (err) {
         if (!cancelled) {
           console.error('[EmbedPlayer] Fetch error:', err);
-          // Retry with backoff for network errors
-          if (retryCount < MAX_RETRIES) {
-            const delay = RETRY_DELAYS[retryCount];
-            retryCount++;
-            console.log(`[EmbedPlayer] Fetch error, retry ${retryCount}/${MAX_RETRIES} in ${delay}ms`);
-            setLoading(true);
-            await new Promise(r => setTimeout(r, delay));
-            if (!cancelled) fetchStreams();
-            return;
-          }
-          setError('Failed to load stream data. Click retry.');
+          setError('Failed to load stream data');
           setLoading(false);
         }
       }
@@ -265,7 +232,10 @@ function EmbedModePlayer({
     const currentId = currentSource?.source;
     if (!currentId) return;
 
-    // Mark current source as failed
+    // Don't auto-switch sources on playback errors.
+    // The ArtPlayerWrapper already tries 5 network + 3 media recovery attempts
+    // with exponential backoff. If it still fails, auto-switching is jarring.
+    // Just mark as failed and let the user choose.
     setFailedSources(prev => {
       const next = new Set(prev);
       next.add(currentId);
@@ -273,20 +243,8 @@ function EmbedModePlayer({
       return next;
     });
 
-    // Try next available source automatically
-    const currentIdx = sortedSourcesRef.current.findIndex(s => s.source === currentId);
-    for (let i = currentIdx + 1; i < sortedSourcesRef.current.length; i++) {
-      const nextSource = sortedSourcesRef.current[i];
-      if (!failedSourcesRef.current.has(nextSource.source)) {
-        console.log(`[EmbedPlayer] Auto-fallback: ${currentId} → ${nextSource.source}`);
-        setCurrentSourceIndex(i);
-        setCurrentSource(nextSource);
-        return;
-      }
-    }
-
-    // No more sources to try
-    setError('Playback error. All servers failed. Click retry.');
+    // Show error but don't auto-switch — user was watching this source
+    setError('Playback error. Try switching to another server or retry.');
   }, [currentSource?.source]);
 
   // ─── Handle next episode ──────────────────────────────────────────────────

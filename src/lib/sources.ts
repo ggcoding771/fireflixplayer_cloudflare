@@ -56,10 +56,10 @@ export const LANG_FLAGS: Record<string, string> = {
   und: '❓',  // Undetermined/Unknown language
 };
 
-// All sources ordered by response time and reliability
-// Order: NetMirror (Moon) → Castle → Atlas → Lyra → rest by speed
+// All sources ordered by quality and reliability
+// NetMirror and Castle are top priority due to multi-language support and quality
 export const SOURCES: SourceConfig[] = [
-  // === 1. NetMirror (Moon) — Top priority, multi-language ===
+  // === Top Priority: Multi-language StreamForge Sources ===
   {
     id: 'sf-netmirror',
     name: 'Moon',
@@ -70,7 +70,6 @@ export const SOURCES: SourceConfig[] = [
     order: 1,
     reliability: 'high',
   },
-  // === 2. Castle — Second priority, multi-language ===
   {
     id: 'sf-castle',
     name: 'Pluto',
@@ -81,30 +80,6 @@ export const SOURCES: SourceConfig[] = [
     order: 2,
     reliability: 'high',
   },
-  // === 3. Atlas — Third priority, fast English ===
-  {
-    id: 'sf-vidrock',
-    name: 'Atlas',
-    apiOrigin: 'streamforge',
-    apiSourceKey: 'vidrock',
-    languageFlags: '🇺🇸',
-    languages: ['en'],
-    order: 3,
-    reliability: 'high',
-  },
-  // === 4. Lyra — Fourth priority, fast English ===
-  {
-    id: 'sf-cinesu',
-    name: 'Lyra',
-    apiOrigin: 'streamforge',
-    apiSourceKey: 'cinesu',
-    languageFlags: '🇺🇸',
-    languages: ['en'],
-    order: 4,
-    reliability: 'high',
-  },
-
-  // === Rest: High reliability sources first, then medium, then low ===
   {
     id: 'sf-dooflix',
     name: 'Venus',
@@ -112,8 +87,18 @@ export const SOURCES: SourceConfig[] = [
     apiSourceKey: 'dooflix',
     languageFlags: '🇮🇳🇺🇸',
     languages: ['hi', 'en', 'multi'],
-    order: 5,
+    order: 3,
     reliability: 'high',
+  },
+  {
+    id: 'sf-vidnest',
+    name: 'Neptune',
+    apiOrigin: 'streamforge',
+    apiSourceKey: 'vidnest',
+    languageFlags: '🇫🇷🇺🇸🇰🇷',
+    languages: ['fr', 'en', 'ko', 'multi'],
+    order: 4,
+    reliability: 'medium',
   },
   {
     id: 'sf-movieboxhindi',
@@ -122,9 +107,21 @@ export const SOURCES: SourceConfig[] = [
     apiSourceKey: 'movieboxhindi',
     languageFlags: '🇮🇳🇺🇸',
     languages: ['hi', 'en'],
-    order: 6,
+    order: 5,
     reliability: 'high',
   },
+  {
+    id: 'sf-allmovieland',
+    name: 'Saturn',
+    apiOrigin: 'streamforge',
+    apiSourceKey: 'allmovieland',
+    languageFlags: '🇮🇳🇺🇸',
+    languages: ['hi', 'ta', 'te', 'en', 'multi'],
+    order: 6,
+    reliability: 'medium',
+  },
+
+  // === MissouriMonster Sources (English, fast) ===
   {
     id: 'mm-cinesu',
     name: 'Orion',
@@ -175,38 +172,6 @@ export const SOURCES: SourceConfig[] = [
     order: 11,
     reliability: 'high',
   },
-
-  // === Medium reliability ===
-  {
-    id: 'sf-vidnest',
-    name: 'Neptune',
-    apiOrigin: 'streamforge',
-    apiSourceKey: 'vidnest',
-    languageFlags: '🇫🇷🇺🇸🇰🇷',
-    languages: ['fr', 'en', 'ko', 'multi'],
-    order: 12,
-    reliability: 'medium',
-  },
-  {
-    id: 'sf-allmovieland',
-    name: 'Saturn',
-    apiOrigin: 'streamforge',
-    apiSourceKey: 'allmovieland',
-    languageFlags: '🇮🇳🇺🇸',
-    languages: ['hi', 'ta', 'te', 'en', 'multi'],
-    order: 13,
-    reliability: 'medium',
-  },
-  {
-    id: 'sf-videasy',
-    name: 'Cosmos',
-    apiOrigin: 'streamforge',
-    apiSourceKey: 'videasy',
-    languageFlags: '🇺🇸',
-    languages: ['en', 'multi'],
-    order: 14,
-    reliability: 'medium',
-  },
   {
     id: 'mm-icefy',
     name: 'Glacier',
@@ -214,7 +179,7 @@ export const SOURCES: SourceConfig[] = [
     apiSourceKey: 'icefy',
     languageFlags: '🇺🇸',
     languages: ['en'],
-    order: 15,
+    order: 12,
     reliability: 'medium',
   },
   {
@@ -224,7 +189,7 @@ export const SOURCES: SourceConfig[] = [
     apiSourceKey: 'fsharetv',
     languageFlags: '🇺🇸',
     languages: ['en'],
-    order: 16,
+    order: 13,
     reliability: 'medium',
   },
   {
@@ -234,7 +199,7 @@ export const SOURCES: SourceConfig[] = [
     apiSourceKey: 'vidzee',
     languageFlags: '🇺🇸',
     languages: ['en'],
-    order: 17,
+    order: 14,
     reliability: 'medium',
   },
   {
@@ -244,11 +209,9 @@ export const SOURCES: SourceConfig[] = [
     apiSourceKey: 'vidfun',
     languageFlags: '🇺🇸',
     languages: ['en'],
-    order: 18,
+    order: 15,
     reliability: 'medium',
   },
-
-  // === Low reliability / broken ===
   {
     id: 'mm-cinezo',
     name: 'Nebula',
@@ -256,7 +219,7 @@ export const SOURCES: SourceConfig[] = [
     apiSourceKey: 'cinezo',
     languageFlags: '🇺🇸',
     languages: ['en'],
-    order: 19,
+    order: 16,
     reliability: 'low',
   },
   {
@@ -266,8 +229,51 @@ export const SOURCES: SourceConfig[] = [
     apiSourceKey: 'videasy',
     languageFlags: '🇺🇸',
     languages: ['en'],
-    order: 20,
+    order: 17,
     reliability: 'low',
+  },
+  {
+    id: 'mm-vixsrc',
+    name: 'Phantom',
+    apiOrigin: 'missourimonster',
+    apiSourceKey: 'vixsrc',
+    languageFlags: '🇺🇸',
+    languages: ['en'],
+    order: 18,
+    reliability: 'low',
+    note: 'Cloudflare-blocked from datacenter IPs',
+  },
+
+  // === Lower Priority StreamForge Sources ===
+  {
+    id: 'sf-cinesu',
+    name: 'Lyra',
+    apiOrigin: 'streamforge',
+    apiSourceKey: 'cinesu',
+    languageFlags: '🇺🇸',
+    languages: ['en'],
+    order: 19,
+    reliability: 'high',
+  },
+  {
+    id: 'sf-vidrock',
+    name: 'Atlas',
+    apiOrigin: 'streamforge',
+    apiSourceKey: 'vidrock',
+    languageFlags: '🇺🇸',
+    languages: ['en'],
+    order: 20,
+    reliability: 'high',
+  },
+  {
+    id: 'sf-videasy',
+    name: 'Cosmos',
+    apiOrigin: 'streamforge',
+    apiSourceKey: 'videasy',
+    languageFlags: '🇺🇸',
+    languages: ['en', 'multi'],
+    order: 21,
+    reliability: 'medium',
   },
   {
     id: 'sf-vixsrc',
@@ -276,7 +282,7 @@ export const SOURCES: SourceConfig[] = [
     apiSourceKey: 'vixsrc',
     languageFlags: '🇺🇸🇮🇹',
     languages: ['en', 'it', 'multi'],
-    order: 21,
+    order: 22,
     reliability: 'low',
     note: 'Cloudflare-blocked from datacenter IPs',
   },
@@ -285,17 +291,6 @@ export const SOURCES: SourceConfig[] = [
     name: 'Echo',
     apiOrigin: 'streamforge',
     apiSourceKey: 'vidsrc',
-    languageFlags: '🇺🇸',
-    languages: ['en'],
-    order: 22,
-    reliability: 'low',
-    note: 'Cloudflare-blocked from datacenter IPs',
-  },
-  {
-    id: 'mm-vixsrc',
-    name: 'Phantom',
-    apiOrigin: 'missourimonster',
-    apiSourceKey: 'vixsrc',
     languageFlags: '🇺🇸',
     languages: ['en'],
     order: 23,

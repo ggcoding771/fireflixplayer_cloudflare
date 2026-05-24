@@ -98,14 +98,45 @@ function buildCacheKey(type: string, id: string, season?: string, episode?: stri
   return `${type}:${id}`
 }
 
+/**
+ * Check if a URL points to a Castle CDN (blocked by CF Workers).
+ * Castle uses rotating CDN domains but always has /myhls_mps/ in the path.
+ */
+function isCastleCDN(url: string): boolean {
+  try {
+    const hostname = new URL(url).hostname.toLowerCase();
+    const path = new URL(url).pathname.toLowerCase();
+    const castleDomains = [
+      'imgcdn.kim', 'mlnou.com', 'hcovw.com', 'toxcw.com', 'fdwoc.com', 'txoxc.com', 'hsxco.com',
+    ];
+    const isKnownDomain = castleDomains.some(d => hostname === d || hostname.endsWith('.' + d));
+    const isCastlePath = path.includes('/myhls_mps/') || path.includes('/hls_mps/');
+    return isKnownDomain || isCastlePath;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Check if a URL points to a freecdn CDN
+ */
+function isFreecdnCDN(url: string): boolean {
+  try {
+    const hostname = new URL(url).hostname.toLowerCase();
+    return /freecdn\d*\.top/.test(hostname);
+  } catch {
+    return false;
+  }
+}
+
+
 function buildProxyUrl(directUrl: string, headers?: Record<string, string>): string {
-  // Castle CDN URLs are behind Cloudflare and CANNOT be fetched by CF Workers
-  // (Cdn-Loop header causes 403). Return the HF proxy URL directly so the
-  // browser fetches from HF proxy (not through CF Worker).
-  if (isCastleCDN(directUrl)) {
+  // Castle and freecdn CDNs block CF Workers' IPs — route through HF proxy
+  if (isCastleCDN(directUrl) || isFreecdnCDN(directUrl)) {
     return buildHFProxyUrl(directUrl, headers);
   }
 
+  // Other CDNs: use local proxy
   const params = new URLSearchParams({ url: directUrl });
   if (headers?.Referer) params.set('referer', headers.Referer);
   if (headers?.Origin) params.set('origin', headers.Origin);
@@ -116,25 +147,6 @@ function buildProxyUrl(directUrl: string, headers?: Record<string, string>): str
     } catch { /* ignore */ }
   }
   return `/api/proxy?${params.toString()}`;
-}
-
-/**
- * Check if a URL points to a Castle CDN (behind Cloudflare).
- * These CDNs block CF Worker requests due to Cdn-Loop detection.
- */
-function isCastleCDN(url: string): boolean {
-  try {
-    const urlObj = new URL(url);
-    const hostname = urlObj.hostname.toLowerCase();
-    const pathname = urlObj.pathname.toLowerCase();
-    // Castle CDN pattern: img1.*.com with /myhls_mps/ path
-    if (/^img\d+\..+\.com$/.test(hostname) && pathname.includes('/myhls_mps/')) {
-      return true;
-    }
-    return false;
-  } catch {
-    return false;
-  }
 }
 
 /**
@@ -306,20 +318,8 @@ async function fetchMissouriMonster(
       let qualities: QualityLevel[] = [];
       let subtitles: StreamResult['subtitles'] = [];
 
-      // Fetch m3u8 — Castle CDNs need HF proxy (CF Worker blocked by Cdn-Loop)
       try {
-        let m3u8Response: Response;
-        if (isCastleCDN(data.url)) {
-          // Route through HF proxy for Castle CDNs (behind CF, blocks CF Workers)
-          const m3u8ProxyUrl = `${HF_PROXY_BASE}/proxy?url=${encodeURIComponent(data.url)}&referer=${encodeURIComponent('https://net52.cc/')}&origin=${encodeURIComponent('https://net52.cc')}`;
-          m3u8Response = await fetch(m3u8ProxyUrl, { signal: AbortSignal.timeout(10000) });
-        } else {
-          // Direct fetch for non-Castle CDNs
-          m3u8Response = await fetch(data.url, {
-            headers: { 'Referer': 'https://net52.cc/', 'Origin': 'https://net52.cc' },
-            signal: AbortSignal.timeout(10000),
-          });
-        }
+        const m3u8Response = await fetch(data.url, { signal: AbortSignal.timeout(10000) });
         if (m3u8Response.ok) {
           const m3u8Content = await m3u8Response.text();
           if (m3u8Content.includes('#EXTM3U')) {
@@ -365,8 +365,6 @@ async function fetchMissouriMonster(
         // subtitle fetch failed, continue without
       }
 
-      // Match Vercel behavior: return raw URL, needsProxy: false
-      // The /api/proxy handles URL rewriting when the browser loads through it
       return {
         sourceId: `mm-${sourceKey}`,
         sourceName: data.source || sourceKey,
@@ -517,7 +515,6 @@ async function fetchStreamForge(
           if (r.headers) Object.assign(resultHeaders, r.headers);
 
           try {
-            // Direct fetch for m3u8 parsing (like Vercel version)
             const fetchHeaders: Record<string, string> = {};
             if (resultHeaders.Referer) fetchHeaders['Referer'] = resultHeaders.Referer;
             if (resultHeaders['User-Agent']) fetchHeaders['User-Agent'] = resultHeaders['User-Agent'];
@@ -971,8 +968,6 @@ export async function GET(request: NextRequest) {
   ])
 
   // Merge sources — StreamForge FIRST, then missourimonster
-  // Match Vercel behavior: MM sources are NOT wrapped with proxy
-  // The proxy handles URL rewriting when the browser loads through it
   const mmSources: StreamSource[] = (mmData?.sources || []).map((s: StreamSource) => ({
     ...s,
     language: s.language || undefined,

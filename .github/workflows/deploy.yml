@@ -8,12 +8,9 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      deployments: write
+    name: Deploy
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -21,33 +18,16 @@ jobs:
           bun-version: latest
 
       - name: Install dependencies
-        run: bun install --frozen-lockfile
+        run: bun install
 
-      - name: Build for Cloudflare
-        run: npx opennextjs-cloudflare build --skipWranglerConfigCheck
-
-      - name: Prepare Pages deployment
-        run: |
-          # Copy worker as _worker.js for Pages Functions
-          cp .open-next/worker.js .open-next/assets/_worker.js
-          # Copy all worker dependencies
-          cp -r .open-next/cloudflare .open-next/assets/cloudflare
-          cp -r .open-next/middleware .open-next/assets/middleware
-          cp -r .open-next/server-functions .open-next/assets/server-functions
-          cp -r .open-next/.build .open-next/assets/.build
-          # Create _routes.json so static assets are served directly
-          # and only dynamic routes go through the Worker
-          cat > .open-next/assets/_routes.json << 'EOF'
-          {
-            "version": 1,
-            "include": ["/*"],
-            "exclude": ["/_next/static/*", "/logo.svg", "/robots.txt", "/BUILD_ID"]
-          }
-          EOF
+      - name: Build with OpenNext for Cloudflare
+        run: npx opennextjs-cloudflare build
+        env:
+          TMDB_API_KEY: ${{ secrets.TMDB_API_KEY || '7967738a03ec215c7d6d675faba9c973' }}
 
       - name: Deploy to Cloudflare Pages
         uses: cloudflare/wrangler-action@v3
         with:
-          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: pages deploy .open-next/assets --project-name=fireflixplayer --commit-dirty=true
+          apiToken: ${{ secrets.CF_API_TOKEN }}
+          accountId: db18b7bbe7cad3a8e87df146c0516b7d
+          command: pages deploy .open-next/worker --project-name=fireflixplayer
