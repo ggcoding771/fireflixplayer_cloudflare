@@ -119,11 +119,14 @@ function EmbedModePlayer({
 
         // Sort sources by priority (same order as the reference)
         const sorted = [...data.sources].sort((a, b) => {
+          // NetMirror → Castle → Atlas(vidrock) → Lyra(cinesu) → SF → MM → low
           const priorityOrder = [
-            'showbox', 'cinesu', 'popr', 'vidnest', 'dooflix', 'castle',
-            'movieboxhindi', 'vidrock', 'videasy', 'netmirror', 'allmovieland',
-            'cinezo', 'vidlink', 'vidzee', 'flixhq', 'icefy', 'vidfun',
-            'meowtv', 'vidking', 'vixsrc',
+            'netmirror', 'castle', 'vidrock', 'cinesu',
+            'dooflix', 'movieboxhindi',
+            'vidnest', 'allmovieland', 'videasy',
+            'cinesu', 'meowtv', 'vidlink', 'flixhq', 'vidrock',
+            'icefy', 'fsharetv', 'vidzee', 'vidfun',
+            'cinezo', 'vixsrc', 'vidsrc',
           ];
           const aIdx = priorityOrder.indexOf(a.source);
           const bIdx = priorityOrder.indexOf(b.source);
