@@ -30,4 +30,4 @@ jobs:
         with:
           apiToken: ${{ secrets.CF_API_TOKEN }}
           accountId: db18b7bbe7cad3a8e87df146c0516b7d
-          command: pages deploy .open-next/worker --project-name=fireflixplayer
+          command: pages deploy .open-next/assets --project-name=fireflixplayer
