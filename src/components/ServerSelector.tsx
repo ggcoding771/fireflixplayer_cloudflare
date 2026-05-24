@@ -9,7 +9,7 @@ interface ServerSelectorProps {
   sources: SourceInfo[];
   sourceStatuses: Record<string, SourceStatus>;
   activeSourceId: string | null;
-  onSelectSource: (sourceId: string) => void;
+  onSelectSource: (sourceId: string, streamUrl?: string) => void;
   onSelectSubStream?: (sourceId: string, streamUrl: string, streamTitle: string, desiredLanguage?: string) => void;
   fetchSource: (sourceId: string) => Promise<SourceStatus>;
   autoOpenSourceId?: string | null;
@@ -90,7 +90,7 @@ export function ServerSelector({
 
     // If already fetched and successful with no multi-streams, play directly
     if (status?.status === 'success' && status.streamUrl) {
-      onSelectSource(sourceId);
+      onSelectSource(sourceId, status.streamUrl);
       setIsOpen(false);
       return;
     }
@@ -110,7 +110,7 @@ export function ServerSelector({
         setSelectedSourceForTracks(sourceId);
         setTimeout(() => scrollContainerRef.current?.scrollTo({ top: 0 }), 0);
       } else if (newStatus.status === 'success' && newStatus.streamUrl) {
-        onSelectSource(sourceId);
+        onSelectSource(sourceId, newStatus.streamUrl);
         setIsOpen(false);
       }
     } finally {

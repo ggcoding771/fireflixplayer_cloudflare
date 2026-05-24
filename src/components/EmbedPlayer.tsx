@@ -240,8 +240,20 @@ export function EmbedPlayer({ tmdbId, type, season, episode }: EmbedPlayerProps)
     setActiveHeaders(undefined);
   }, [activeSourceId, updateSourceStatus]);
 
-  const handleSelectSource = useCallback(async (sourceId: string) => {
+  const handleSelectSource = useCallback(async (sourceId: string, providedUrl?: string) => {
     autoPlayAbortedRef.current = true;
+
+    // If a URL was provided directly (e.g. from ServerSelector after successful fetch),
+    // use it immediately without checking the potentially stale ref
+    if (providedUrl) {
+      const status = sourceStatusesRef.current[sourceId];
+      playSource(sourceId, providedUrl);
+      // Also set headers from the status if available
+      if (status?.headers) {
+        setActiveHeaders(status.headers);
+      }
+      return;
+    }
 
     const existingStatus = sourceStatusesRef.current[sourceId];
 
