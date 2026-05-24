@@ -85,10 +85,13 @@ function EmbedModePlayer({
   useEffect(() => { currentSourceIndexRef.current = currentSourceIndex }, [currentSourceIndex]);
   useEffect(() => { failedSourcesRef.current = failedSources }, [failedSources]);
 
-  // ─── Fetch stream data ────────────────────────────────────────────────────
+  // ─── Fetch stream data with retry for network hiccups ────────────────────────
   useEffect(() => {
     if (!tmdbId) return;
     let cancelled = false;
+    let retryCount = 0;
+    const MAX_RETRIES = 3;
+    const RETRY_DELAYS = [2000, 4000, 8000]; // exponential backoff
 
     const fetchStreams = async () => {
       setLoading(true);
@@ -112,6 +115,16 @@ function EmbedModePlayer({
         if (cancelled) return;
 
         if (!data.sources || data.sources.length === 0) {
+          // No sources — retry with backoff before giving up
+          if (retryCount < MAX_RETRIES) {
+            const delay = RETRY_DELAYS[retryCount];
+            retryCount++;
+            console.log(`[EmbedPlayer] No sources, retry ${retryCount}/${MAX_RETRIES} in ${delay}ms`);
+            setLoading(true);
+            await new Promise(r => setTimeout(r, delay));
+            if (!cancelled) fetchStreams();
+            return;
+          }
           setError('No streams available for this content');
           setLoading(false);
           return;
@@ -150,7 +163,17 @@ function EmbedModePlayer({
       } catch (err) {
         if (!cancelled) {
           console.error('[EmbedPlayer] Fetch error:', err);
-          setError('Failed to load stream data');
+          // Retry with backoff for network errors
+          if (retryCount < MAX_RETRIES) {
+            const delay = RETRY_DELAYS[retryCount];
+            retryCount++;
+            console.log(`[EmbedPlayer] Fetch error, retry ${retryCount}/${MAX_RETRIES} in ${delay}ms`);
+            setLoading(true);
+            await new Promise(r => setTimeout(r, delay));
+            if (!cancelled) fetchStreams();
+            return;
+          }
+          setError('Failed to load stream data. Click retry.');
           setLoading(false);
         }
       }
@@ -242,10 +265,7 @@ function EmbedModePlayer({
     const currentId = currentSource?.source;
     if (!currentId) return;
 
-    // Don't auto-switch sources on playback errors.
-    // The ArtPlayerWrapper already tries 5 network + 3 media recovery attempts
-    // with exponential backoff. If it still fails, auto-switching is jarring.
-    // Just mark as failed and let the user choose.
+    // Mark current source as failed
     setFailedSources(prev => {
       const next = new Set(prev);
       next.add(currentId);
@@ -253,8 +273,20 @@ function EmbedModePlayer({
       return next;
     });
 
-    // Show error but don't auto-switch — user was watching this source
-    setError('Playback error. Try switching to another server or retry.');
+    // Try next available source automatically
+    const currentIdx = sortedSourcesRef.current.findIndex(s => s.source === currentId);
+    for (let i = currentIdx + 1; i < sortedSourcesRef.current.length; i++) {
+      const nextSource = sortedSourcesRef.current[i];
+      if (!failedSourcesRef.current.has(nextSource.source)) {
+        console.log(`[EmbedPlayer] Auto-fallback: ${currentId} → ${nextSource.source}`);
+        setCurrentSourceIndex(i);
+        setCurrentSource(nextSource);
+        return;
+      }
+    }
+
+    // No more sources to try
+    setError('Playback error. All servers failed. Click retry.');
   }, [currentSource?.source]);
 
   // ─── Handle next episode ──────────────────────────────────────────────────
