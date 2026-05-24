@@ -28,11 +28,22 @@ jobs:
 
       - name: Prepare Pages deployment
         run: |
+          # Copy worker as _worker.js for Pages Functions
           cp .open-next/worker.js .open-next/assets/_worker.js
+          # Copy all worker dependencies
           cp -r .open-next/cloudflare .open-next/assets/cloudflare
           cp -r .open-next/middleware .open-next/assets/middleware
           cp -r .open-next/server-functions .open-next/assets/server-functions
           cp -r .open-next/.build .open-next/assets/.build
+          # Create _routes.json so static assets are served directly
+          # and only dynamic routes go through the Worker
+          cat > .open-next/assets/_routes.json << 'EOF'
+          {
+            "version": 1,
+            "include": ["/*"],
+            "exclude": ["/_next/static/*", "/logo.svg", "/robots.txt", "/BUILD_ID"]
+          }
+          EOF
 
       - name: Deploy to Cloudflare Pages
         uses: cloudflare/wrangler-action@v3
