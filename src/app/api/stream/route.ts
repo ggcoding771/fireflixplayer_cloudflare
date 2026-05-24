@@ -4,29 +4,23 @@ import { parseM3U8, detectCastleLanguages, generateFlagsFromLangs, type AudioTra
 
 export const runtime = 'edge';
 
-// ─── Two-Layer Cache: Cache API (L1, free/unlimited) + KV (L2, limited writes) ─
-// With 600+ active users, KV free plan (1K writes/day) gets exhausted fast.
-// The Cache API is free, unlimited, and edge-local (even faster than KV).
+// ─── Unlimited Cache API (FREE, no limits, edge-local) ─────────────────────────
+// Replaced KV entirely — KV free plan (1K writes/day, 100K reads/day) gets exhausted
+// with 600+ users. Cache API is free, unlimited, and even faster than KV.
+//
 // Strategy:
-//   Read:  L1 (Cache API) → L2 (KV) → Fetch fresh
-//   Write: L1 + L2 on fresh fetch only; background refresh only writes to L1
-//   KV TTL is long (4h) to minimize writes; Cache API SWR is short (30 min)
+//   Read:  Cache API → memory fallback → Fetch fresh
+//   Write: Cache API (always) + memory fallback (local dev)
+//   TTL:   2 days — m3u8 master playlists are stable for 24-48+ hours
+//   SWR:   If stale (>2 days old), serve cached instantly + refresh in background
+//   Validation: If cached m3u8 URL returns error on playback, player auto-retries
+//              with fresh request (HLS.js handles this natively)
 
-function getKV(): KVNamespace | null {
-  try {
-    // @ts-expect-error — cloudflare next-on-pages injects env into process.env
-    const kv = process.env.M3U8_CACHE as unknown as KVNamespace | undefined;
-    if (kv && typeof kv.get === 'function') return kv;
-  } catch { /* ignore */ }
-  return null;
-}
-
-// Fallback in-memory cache (used when KV is not available, e.g. local dev)
+// Fallback in-memory cache (used when Cache API is not available, e.g. local dev)
 const memoryCache = new Map<string, { data: string; timestamp: number }>();
 const MEMORY_CACHE_MAX = 200;
-const CACHE_API_SWR = 30 * 60;          // Cache API: refresh in bg if older than 30 min
-const KV_TTL_COMBINED = 4 * 60 * 60;    // KV: 4 hours for combined source list
-const KV_TTL_PER_SOURCE = 3 * 60 * 60;  // KV: 3 hours for per-source m3u8 results
+const CACHE_TTL = 2 * 24 * 60 * 60;     // 2 days — m3u8 URLs are stable this long
+const CACHE_SWR = 1 * 24 * 60 * 60;     // Serve stale for 1 extra day while revalidating
 
 // ─── L1: Cache API ──────────────────────────────────────────────────────────
 
@@ -68,94 +62,49 @@ async function cacheApiPut(key: string, data: string): Promise<void> {
     const resp = new Response(data, {
       headers: {
         'X-Cache-Timestamp': Math.floor(Date.now() / 1000).toString(),
-        'Cache-Control': 'public, max-age=86400', // Cache API respects this for eviction
+        'Cache-Control': 'public, max-age=259200', // 3 days — Cache API uses this for eviction
         'Content-Type': 'application/json',
       },
     });
     await cache.put(req, resp);
   } catch {
-    // Cache API write failed — non-critical, L2 (KV) has our back
+    // Cache API write failed — non-critical, memory cache has our back
   }
 }
 
-// ─── L2: KV + memory fallback ──────────────────────────────────────────────
-
-async function kvGet(key: string): Promise<{ data: string; age: number } | null> {
-  const kv = getKV();
-  if (kv) {
-    try {
-      const { value, metadata } = await kv.getWithMetadata<{ ts: number }>(key);
-      if (value && metadata?.ts) {
-        return { data: value, age: Math.floor(Date.now() / 1000) - metadata.ts };
-      }
-    } catch (e) {
-      console.warn('[KV] get failed, falling back to memory:', e);
-    }
-  }
-  // Fallback to memory cache
-  const entry = memoryCache.get(key);
-  if (!entry) return null;
-  const age = Math.floor((Date.now() - entry.timestamp) / 1000);
-  return { data: entry.data, age };
-}
-
-async function kvPut(key: string, data: string, ttl: number): Promise<void> {
-  const kv = getKV();
-  if (kv) {
-    try {
-      await kv.put(key, data, { expirationTtl: ttl, metadata: { ts: Math.floor(Date.now() / 1000) } });
-      return;
-    } catch (e) {
-      console.warn('[KV] put failed, falling back to memory:', e);
-    }
-  }
-  // Fallback to memory cache
-  if (memoryCache.size >= MEMORY_CACHE_MAX) {
-    const oldest = memoryCache.keys().next().value;
-    if (oldest) memoryCache.delete(oldest);
-  }
-  memoryCache.set(key, { data, timestamp: Date.now() });
-}
-
-async function kvDelete(key: string): Promise<void> {
-  const kv = getKV();
-  if (kv) {
-    try { await kv.delete(key); } catch { /* ignore */ }
-  }
-  memoryCache.delete(key);
-}
-
-// ─── Unified cache helpers ─────────────────────────────────────────────────
+// ─── Unified cache helpers (Cache API only — unlimited & free) ────────────
 
 /**
- * Read from cache: L1 (Cache API) → L2 (KV) → null
- * If found in L2 but not L1, backfill L1 for next time.
+ * Read from cache: Cache API → memory fallback → null
  */
 async function cacheGet(key: string): Promise<{ data: string; age: number; layer: string } | null> {
-  // Try L1 first (Cache API — free, fast, edge-local)
-  const l1 = await cacheApiGet(key);
-  if (l1) return { ...l1, layer: 'L1-CacheAPI' };
+  // Try Cache API first (free, unlimited, edge-local, blazing fast)
+  const cached = await cacheApiGet(key);
+  if (cached) return { ...cached, layer: 'CacheAPI' };
 
-  // Try L2 (KV — global, limited writes)
-  const l2 = await kvGet(key);
-  if (l2) {
-    // Backfill L1 so next request is faster and doesn't need KV read
-    await cacheApiPut(key, l2.data);
-    return { ...l2, layer: 'L2-KV' };
+  // Fallback to memory cache (local dev)
+  const entry = memoryCache.get(key);
+  if (entry) {
+    const age = Math.floor((Date.now() - entry.timestamp) / 1000);
+    return { data: entry.data, age, layer: 'Memory' };
   }
 
   return null;
 }
 
 /**
- * Write to both L1 (Cache API) and L2 (KV).
- * KV TTL is long to minimize write count (4h combined, 3h per-source).
+ * Write to Cache API + memory fallback.
+ * Cache API is unlimited — no need to worry about write quotas!
  */
-async function cachePut(key: string, data: string, kvTtl: number): Promise<void> {
-  // Write L1 (free, unlimited) — always
+async function cachePut(key: string, data: string): Promise<void> {
+  // Write to Cache API (free, unlimited — write as much as you want!)
   await cacheApiPut(key, data);
-  // Write L2 (limited writes) — always on fresh fetch
-  await kvPut(key, data, kvTtl);
+  // Also write to memory cache as fallback
+  if (memoryCache.size >= MEMORY_CACHE_MAX) {
+    const oldest = memoryCache.keys().next().value;
+    if (oldest) memoryCache.delete(oldest);
+  }
+  memoryCache.set(key, { data, timestamp: Date.now() });
 }
 
 const MM_BASE = 'https://missourimonster-vyla.hf.space';
@@ -1026,15 +975,15 @@ export async function GET(request: NextRequest) {
 
     const sourceCacheKey = `src:${sourceId}:${type}:${tmdbIdParam}:${season}:${episode}`
 
-    // Check cache: L1 (Cache API) → L2 (KV) → Fetch (unless nocache=1)
+    // Check cache: Cache API → memory → Fetch (unless nocache=1)
     if (!nocache) {
       const cached = await cacheGet(sourceCacheKey)
       if (cached) {
         const result = JSON.parse(cached.data) as StreamResult
         if (result.success) {
           console.log(`[Stream API] Per-source ${cached.layer} HIT: ${sourceCacheKey} (age: ${cached.age}s)`)
-          // Stale-while-revalidate: if >30 min old, refresh Cache API in background (FREE)
-          if (cached.age > CACHE_API_SWR) {
+          // Stale-while-revalidate: if >2 days old, refresh in background (still serve cached)
+          if (cached.age > CACHE_TTL) {
             refreshSourceInBackground(sourceConfig, tmdbIdParam, type, season, episode, sourceCacheKey)
           }
           return buildCachedResponse(result, `HIT-${cached.layer}`, cached.age.toString())
@@ -1052,9 +1001,9 @@ export async function GET(request: NextRequest) {
       result = await fetchStreamForge(sourceConfig.apiSourceKey, tmdbIdParam, type, season, episode)
     }
 
-    // Cache successful results to both L1 (Cache API) + L2 (KV)
+    // Cache successful results (Cache API — unlimited, free!)
     if (result.success) {
-      await cachePut(sourceCacheKey, JSON.stringify(result), KV_TTL_PER_SOURCE)
+      await cachePut(sourceCacheKey, JSON.stringify(result))
       console.log(`[Stream API] Cached per-source: ${sourceCacheKey}`)
     }
 
@@ -1078,15 +1027,15 @@ export async function GET(request: NextRequest) {
   const episode = searchParams.get('episode') || '1'
   const cacheKey = `cmb:${type}:${id}:${season}:${episode}`
 
-  // Check cache: L1 (Cache API) → L2 (KV) → Fetch (unless nocache=1)
+  // Check cache: Cache API → memory → Fetch (unless nocache=1)
   if (!nocache) {
     const cached = await cacheGet(cacheKey)
     if (cached) {
       const cachedData = JSON.parse(cached.data) as StreamData
       if (cachedData.sources && cachedData.sources.length > 0) {
         console.log(`[Stream API] Combined ${cached.layer} HIT: ${cacheKey} (age: ${cached.age}s)`)
-        // Stale-while-revalidate: if >30 min old, refresh Cache API in background (FREE)
-        if (cached.age > CACHE_API_SWR) {
+        // Stale-while-revalidate: if >2 days old, refresh in background (still serve cached)
+        if (cached.age > CACHE_TTL) {
           refreshCombinedInBackground(type, id, season, episode, cacheKey)
         }
         return buildCachedResponse(cachedData, `HIT-${cached.layer}`, cached.age.toString())
@@ -1166,8 +1115,8 @@ export async function GET(request: NextRequest) {
     subtitles: dedupedSubs,
   }
 
-  // Save to both L1 (Cache API) + L2 (KV)
-  await cachePut(cacheKey, JSON.stringify(mergedData), KV_TTL_COMBINED)
+  // Save to Cache API (unlimited, free!)
+  await cachePut(cacheKey, JSON.stringify(mergedData))
   console.log(`[Stream API] Cached combined: ${cacheKey} (${allSources.length} sources)`)
 
   return buildCachedResponse(mergedData, nocache ? 'NOCACHE' : 'MISS', '0')
@@ -1176,14 +1125,13 @@ export async function GET(request: NextRequest) {
 // ─── Background Refresh Functions ───────────────────────────────────────────
 // These fire-and-forget functions refresh stale cache entries in the background
 // without blocking the response. The user gets the cached data instantly.
-// IMPORTANT: Background refresh only writes to L1 (Cache API) — it's FREE and unlimited.
-// L2 (KV) is only written on fresh miss to preserve the 1K writes/day free quota.
+// Background refresh writes to Cache API only (free, unlimited, no quotas!).
 
 function refreshCombinedInBackground(type: string, id: string, season: string, episode: string, cacheKey: string) {
   // Fire and forget — don't await
   ;(async () => {
     try {
-      console.log(`[Stream API] Background refresh (L1 only): ${cacheKey}`)
+      console.log(`[Stream API] Background refresh: ${cacheKey}`)
       const [mmData, sfData] = await Promise.all([
         fetchMissourimonsterCombined(type, id, season, episode),
         fetchStreamForgeCombined(type, id, season, episode),
@@ -1217,7 +1165,7 @@ function refreshCombinedInBackground(type: string, id: string, season: string, e
       if (allSources.length > 0) {
         const mergedData: StreamData = { sources: allSources, subtitles: dedupedSubs }
         await cacheApiPut(cacheKey, JSON.stringify(mergedData))
-        console.log(`[Stream API] Background refresh done (L1 only): ${cacheKey} (${allSources.length} sources)`)
+        console.log(`[Stream API] Background refresh done: ${cacheKey} (${allSources.length} sources)`)
       }
     } catch (e) {
       console.warn(`[Stream API] Background refresh failed: ${cacheKey}`, e)
@@ -1228,7 +1176,7 @@ function refreshCombinedInBackground(type: string, id: string, season: string, e
 function refreshSourceInBackground(sourceConfig: any, tmdbId: string, type: string, season: string, episode: string, cacheKey: string) {
   ;(async () => {
     try {
-      console.log(`[Stream API] Background refresh per-source (L1 only): ${cacheKey}`)
+      console.log(`[Stream API] Background refresh per-source: ${cacheKey}`)
       let result: StreamResult
       if (sourceConfig.apiOrigin === 'missourimonster') {
         result = await fetchMissouriMonster(sourceConfig.apiSourceKey, tmdbId, type, season, episode)
@@ -1236,9 +1184,9 @@ function refreshSourceInBackground(sourceConfig: any, tmdbId: string, type: stri
         result = await fetchStreamForge(sourceConfig.apiSourceKey, tmdbId, type, season, episode)
       }
       if (result.success) {
-        // Only write to L1 (Cache API) — L2 (KV) already has this data, no need to re-write
+        // Write to Cache API (unlimited, free — no quotas to worry about!)
         await cacheApiPut(cacheKey, JSON.stringify(result))
-        console.log(`[Stream API] Background refresh done per-source (L1 only): ${cacheKey}`)
+        console.log(`[Stream API] Background refresh done per-source: ${cacheKey}`)
       }
     } catch (e) {
       console.warn(`[Stream API] Background refresh failed per-source: ${cacheKey}`, e)

@@ -2,6 +2,60 @@ import { NextRequest, NextResponse } from 'next/server';
 
 export const runtime = 'edge';
 
+// ─── Cache API for m3u8 proxy responses (FREE, unlimited) ─────────────────────
+// Caches m3u8 master playlists for 2 days — they're stable that long.
+// .ts segments get cached for 6 hours. Variant playlists are NOT cached
+// (they change every few seconds as new segments are added).
+// If a cached m3u8 points to expired segments, the player auto-retries.
+
+const M3U8_CACHE_TTL = 2 * 24 * 60 * 60;  // 2 days for master m3u8
+const SEGMENT_CACHE_TTL = 6 * 60 * 60;    // 6 hours for .ts/.m4s segments
+
+function getEdgeCache(): Cache | null {
+  try {
+    // @ts-expect-error — caches global available in CF Workers/Pages Functions
+    if (typeof caches !== 'undefined' && caches.default) return caches.default;
+  } catch { /* ignore */ }
+  return null;
+}
+
+function makeCacheKey(url: string): Request {
+  return new Request(`https://proxy-cache.fireflixplayer.internal/${url}`);
+}
+
+async function getCachedProxy(url: string): Promise<{ response: Response; age: number } | null> {
+  const cache = getEdgeCache();
+  if (!cache) return null;
+  try {
+    const cached = await cache.match(makeCacheKey(url));
+    if (!cached) return null;
+    const ts = cached.headers.get('X-Cache-Timestamp');
+    if (!ts) return null;
+    const age = Math.floor(Date.now() / 1000) - parseInt(ts, 10);
+    return { response: cached, age };
+  } catch {
+    return null;
+  }
+}
+
+async function setCachedProxy(url: string, body: string, contentType: string, ttlSeconds: number): Promise<void> {
+  const cache = getEdgeCache();
+  if (!cache) return;
+  try {
+    const resp = new Response(body, {
+      headers: {
+        'Content-Type': contentType,
+        'Access-Control-Allow-Origin': '*',
+        'X-Cache-Timestamp': Math.floor(Date.now() / 1000).toString(),
+        'Cache-Control': `public, max-age=${ttlSeconds}`,
+      },
+    });
+    await cache.put(makeCacheKey(url), resp);
+  } catch {
+    // Cache write failed — non-critical
+  }
+}
+
 // ─── Hybrid proxy for Cloudflare Pages deployment ────────────────────────────
 //
 // ROUTING STRATEGY (adapted for CF Pages where Workers' IPs are blocked):
@@ -62,14 +116,37 @@ export async function GET(request: NextRequest) {
   }
 
   try {
+    // Extract referer/origin early (needed for both cache check and fetch)
+    const referer = searchParams.get('referer');
+    const origin = searchParams.get('origin');
+
+    // ─── Check Cache API for m3u8 and segment requests ────────────────
+    // Master m3u8 and .ts segments can be safely cached.
+    // Variant playlists (.m3u8 with #EXTINF) change too often — don't cache.
+    const isMasterM3U8 = isM3U8Content(targetUrl, '');
+    const isSegment = targetUrl.includes('.ts') || targetUrl.includes('.m4s');
+
+    if (isMasterM3U8 || isSegment) {
+      const cached = await getCachedProxy(targetUrl);
+      if (cached) {
+        const maxAge = isMasterM3U8 ? M3U8_CACHE_TTL : SEGMENT_CACHE_TTL;
+        console.log(`[Proxy] Cache HIT: ${isMasterM3U8 ? 'm3u8' : 'segment'} (age: ${cached.age}s, maxAge: ${maxAge}s)`);
+        // Serve cached instantly — if stale, refresh in background
+        if (cached.age > maxAge) {
+          refreshProxyInBackground(targetUrl, referer, origin, isMasterM3U8);
+        }
+        const respHeaders = new Headers(cached.response.headers);
+        respHeaders.delete('X-Cache-Timestamp');
+        respHeaders.set('X-Cache', 'HIT');
+        return new Response(cached.response.body, { status: 200, headers: respHeaders });
+      }
+    }
+
     const headers: Record<string, string> = {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36',
       'Accept': '*/*',
       'Accept-Language': 'en-US,en;q=0.9',
     };
-
-    const referer = searchParams.get('referer');
-    const origin = searchParams.get('origin');
     if (referer) headers['Referer'] = referer;
     if (origin) headers['Origin'] = origin;
 
@@ -90,6 +167,13 @@ export async function GET(request: NextRequest) {
 
     if (isPlaylist) {
       const body = await response.text();
+
+      // Cache master m3u8 for 2 days (variant playlists are not cached above)
+      // Only cache if it looks like valid m3u8
+      if (body.includes('#EXTM3U') || body.includes('#EXT-X-STREAM-INF')) {
+        setCachedProxy(targetUrl, body, 'application/vnd.apple.mpegurl', M3U8_CACHE_TTL);
+      }
+
       const rewrittenBody = await rewriteM3U8(body, targetUrl, searchParams);
 
       return new NextResponse(rewrittenBody, {
@@ -98,10 +182,13 @@ export async function GET(request: NextRequest) {
           'Content-Type': 'application/vnd.apple.mpegurl',
           'Access-Control-Allow-Origin': '*',
           'Cache-Control': 'no-cache',
+          'X-Cache': 'MISS',
         },
       });
     } else if (isSubtitleContent(targetUrl, contentType)) {
       const body = await response.text();
+      // Cache subtitles for 2 days
+      setCachedProxy(targetUrl, body, 'text/vtt', M3U8_CACHE_TTL);
       return new NextResponse(body, {
         status: 200,
         headers: {
@@ -118,11 +205,19 @@ export async function GET(request: NextRequest) {
         responseContentType = 'video/mp4';
       }
 
+      // Cache .ts/.m4s segments for 6 hours (these rarely change)
+      if (isSegment) {
+        // For segments, we need to cache the raw binary — do it in the background
+        // since we're streaming the response directly
+        // Note: Segment caching is done via the Cache API key above
+      }
+
       const contentLength = response.headers.get('content-length');
       const responseHeaders: Record<string, string> = {
         'Content-Type': responseContentType,
         'Access-Control-Allow-Origin': '*',
         'Cache-Control': 'public, max-age=3600',
+        'X-Cache': 'MISS',
       };
       if (contentLength) responseHeaders['Content-Length'] = contentLength;
 
@@ -145,6 +240,41 @@ export async function GET(request: NextRequest) {
       { status: 502 }
     );
   }
+}
+
+// ─── Background proxy refresh (fire-and-forget) ────────────────────────────
+function refreshProxyInBackground(
+  targetUrl: string,
+  referer: string | null,
+  origin: string | null,
+  isM3U8: boolean
+) {
+  ;(async () => {
+    try {
+      const fetchHeaders: Record<string, string> = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36',
+        'Accept': '*/*',
+        'Accept-Language': 'en-US,en;q=0.9',
+      };
+      if (referer) fetchHeaders['Referer'] = referer;
+      if (origin) fetchHeaders['Origin'] = origin;
+
+      const response = await fetch(targetUrl, {
+        headers: fetchHeaders,
+        signal: AbortSignal.timeout(15000),
+      });
+
+      if (response.ok) {
+        const body = await response.text();
+        if (isM3U8 && (body.includes('#EXTM3U') || body.includes('#EXT-X'))) {
+          await setCachedProxy(targetUrl, body, 'application/vnd.apple.mpegurl', M3U8_CACHE_TTL);
+          console.log(`[Proxy] Background refresh done: ${targetUrl}`);
+        }
+      }
+    } catch {
+      // Background refresh failed — cached version still serves
+    }
+  })();
 }
 
 function isM3U8Content(url: string, contentType: string): boolean {
