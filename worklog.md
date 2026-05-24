@@ -57,3 +57,38 @@ Stage Summary:
 - EmbedModePlayer sorts sources: Moon(netmirror) → Castle → Atlas(vidrock) → Lyra(cinesu)
 - Hybrid proxy still works: imgcdn.kim → local, freecdn*.top → HF proxy
 - All endpoints verified working: pages, JS chunks, API routes
+
+---
+Task ID: 3
+Agent: Main Agent
+Task: Fix video playback on Cloudflare Pages — m3u8 URLs not resolving correctly
+
+Work Log:
+- Identified root cause: HF proxy returns m3u8 with relative URLs (/proxy?url=...)
+  that resolve to fireflixplayer.pages.dev/proxy (doesn't exist) instead of /api/proxy
+- Rewrote /api/proxy/route.ts with comprehensive m3u8 URL rewriting:
+  - Case 1: Absolute HF proxy URLs → extract original URL, wrap with /api/proxy
+  - Case 2: Relative HF proxy URLs (/proxy?url=...) → convert to /api/proxy?url=...
+  - Case 3: Absolute CDN URLs → wrap with /api/proxy
+  - Case 4: Relative URLs → resolve against base URL, wrap with /api/proxy
+- Fixed MissouriMonster sources (fetchMissouriMonster) to:
+  - Wrap stream URLs with buildProxyUrl() instead of returning raw CDN URLs
+  - Route m3u8 parsing through HF proxy (CF Worker headers block direct CDN access)
+  - Wrap subtitle URLs with buildProxyUrl()
+- Fixed StreamForge sources m3u8 parsing to route through HF proxy
+- Fixed combined mode (embed mode) to wrap MM source/subtitle URLs with proxy
+- Pushed to GitHub, GitHub Actions deployed successfully
+- Verified all endpoints:
+  - Stream API: 200, all sources wrapped with /api/proxy
+  - NetMirror m3u8: 200, all URLs rewritten to /api/proxy (subtitles, audio, quality playlists)
+  - NetMirror sub-playlist: 200, all segment URLs rewritten to /api/proxy
+  - NetMirror segment: 200, 212KB video data with correct content-type
+  - CineSu source: 200, segment URLs (TikTok CDN) properly proxied
+  - Castle sources: 403 (auth_key may be IP-bound or require specific Referer — separate issue)
+
+Stage Summary:
+- Video playback proxy chain now works: browser → /api/proxy → HF proxy → CDN
+- m3u8 URL rewriting handles all URL types (absolute, relative, CDN, HF proxy)
+- All sources now wrapped with /api/proxy (no raw CDN URLs sent to browser)
+- Castle sources return 403 through HF proxy — likely IP-bound auth_keys, may need investigation
+- NetMirror, CineSu, and other sources verified working
