@@ -4,14 +4,72 @@ import { parseM3U8, detectCastleLanguages, generateFlagsFromLangs, type AudioTra
 
 export const runtime = 'edge';
 
+// ─── Cloudflare KV Cache ────────────────────────────────────────────────────
+// Access KV via @cloudflare/next-on-pages request context, with memory fallback
+
+function getKV(): KVNamespace | null {
+  try {
+    // @ts-expect-error — cloudflare next-on-pages injects env into process.env
+    const kv = process.env.M3U8_CACHE as unknown as KVNamespace | undefined;
+    if (kv && typeof kv.get === 'function') return kv;
+  } catch { /* ignore */ }
+  return null;
+}
+
+// Fallback in-memory cache (used when KV is not available, e.g. local dev)
+const memoryCache = new Map<string, { data: string; timestamp: number }>();
+const MEMORY_CACHE_MAX = 200;
+const KV_TTL_COMBINED = 30 * 60;       // 30 min for combined source list
+const KV_TTL_PER_SOURCE = 20 * 60;     // 20 min for per-source m3u8 results
+const STALE_WHILE_REVALIDATE = 10 * 60; // Refresh in bg if older than 10 min
+
+async function kvGet(key: string): Promise<{ data: string; age: number } | null> {
+  const kv = getKV();
+  if (kv) {
+    try {
+      const { value, metadata } = await kv.getWithMetadata<{ ts: number }>(key);
+      if (value && metadata?.ts) {
+        return { data: value, age: Math.floor(Date.now() / 1000) - metadata.ts };
+      }
+    } catch (e) {
+      console.warn('[KV] get failed, falling back to memory:', e);
+    }
+  }
+  // Fallback to memory cache
+  const entry = memoryCache.get(key);
+  if (!entry) return null;
+  const age = Math.floor((Date.now() - entry.timestamp) / 1000);
+  return { data: entry.data, age };
+}
+
+async function kvPut(key: string, data: string, ttl: number): Promise<void> {
+  const kv = getKV();
+  if (kv) {
+    try {
+      await kv.put(key, data, { expirationTtl: ttl, metadata: { ts: Math.floor(Date.now() / 1000) } });
+      return;
+    } catch (e) {
+      console.warn('[KV] put failed, falling back to memory:', e);
+    }
+  }
+  // Fallback to memory cache
+  if (memoryCache.size >= MEMORY_CACHE_MAX) {
+    const oldest = memoryCache.keys().next().value;
+    if (oldest) memoryCache.delete(oldest);
+  }
+  memoryCache.set(key, { data, timestamp: Date.now() });
+}
+
+async function kvDelete(key: string): Promise<void> {
+  const kv = getKV();
+  if (kv) {
+    try { await kv.delete(key); } catch { /* ignore */ }
+  }
+  memoryCache.delete(key);
+}
+
 const MM_BASE = 'https://missourimonster-vyla.hf.space';
 const SF_BASE = 'https://epiccodergg-streamforge-api.hf.space';
-
-// HF proxy base URL — used by local /api/proxy for routing freecdn URLs
-// The local proxy now handles hybrid routing:
-//   - imgcdn.kim (fast, open CDN) → local proxy (URL rewriting only)
-//   - freecdn*.top (hotlink-protected) → HF proxy (bypasses Origin checks)
-// This keeps imgcdn.kim fast while only routing protected CDN traffic through HF.
 const HF_PROXY_BASE = 'https://epiccodergg-fireflix-api.hf.space';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -67,38 +125,7 @@ interface StreamResult {
   }>;
 }
 
-// ─── In-memory LRU cache (for combined mode) ─────────────────────────────────
-
-const memoryCache = new Map<string, { data: StreamData; timestamp: number }>()
-const MEMORY_CACHE_MAX = 200
-const MEMORY_CACHE_TTL_MS = 2 * 60 * 60 * 1000 // 2 hours
-
-function getMemoryCache(key: string): StreamData | null {
-  const entry = memoryCache.get(key)
-  if (!entry) return null
-  if (Date.now() - entry.timestamp > MEMORY_CACHE_TTL_MS) {
-    memoryCache.delete(key)
-    return null
-  }
-  return entry.data
-}
-
-function setMemoryCache(key: string, data: StreamData): void {
-  if (memoryCache.size >= MEMORY_CACHE_MAX) {
-    const oldest = memoryCache.keys().next().value
-    if (oldest) memoryCache.delete(oldest)
-  }
-  memoryCache.set(key, { data, timestamp: Date.now() })
-}
-
 // ─── Helper functions ─────────────────────────────────────────────────────────
-
-function buildCacheKey(type: string, id: string, season?: string, episode?: string): string {
-  if (type === 'tv') {
-    return `${type}:${id}:${season || '1'}:${episode || '1'}`
-  }
-  return `${type}:${id}`
-}
 
 /**
  * Check if a URL points to a Castle CDN (blocked by CF Workers).
@@ -863,11 +890,10 @@ async function fetchStreamForgeCombined(type: string, tmdbId: string, season: st
   }
 }
 
-function buildCachedResponse(data: StreamData, cacheStatus: string, age: string): NextResponse {
+function buildCachedResponse(data: any, cacheStatus: string, age: string): NextResponse {
   return NextResponse.json(data, {
     headers: {
-      'Cache-Control': 'public, s-maxage=7200, stale-while-revalidate=86400, must-revalidate',
-      'CDN-Cache-Control': 'public, s-maxage=7200, stale-while-revalidate=86400',
+      'Cache-Control': 'public, s-maxage=600, stale-while-revalidate=3600',
       'X-Cache': cacheStatus,
       'X-Cache-Age': age,
       'Vary': 'Accept-Encoding',
@@ -889,6 +915,7 @@ function buildNoCacheResponse(data: any, status: number): NextResponse {
 
 export async function GET(request: NextRequest) {
   const searchParams = request.nextUrl.searchParams
+  const nocache = searchParams.get('nocache') === '1'
 
   // ─── Mode 1: Per-source fetch (existing EmbedPlayer mode) ────────────────
   const sourceId = searchParams.get('sourceId')
@@ -896,8 +923,8 @@ export async function GET(request: NextRequest) {
 
   if (sourceId && tmdbIdParam) {
     const type = searchParams.get('type') || 'movie'
-    const season = searchParams.get('season')
-    const episode = searchParams.get('episode')
+    const season = searchParams.get('season') || '1'
+    const episode = searchParams.get('episode') || '1'
 
     const sourceConfig = getSourceById(sourceId)
     if (!sourceConfig) {
@@ -907,27 +934,43 @@ export async function GET(request: NextRequest) {
       )
     }
 
+    const sourceCacheKey = `src:${sourceId}:${type}:${tmdbIdParam}:${season}:${episode}`
+
+    // Check KV cache (unless nocache=1)
+    if (!nocache) {
+      const cached = await kvGet(sourceCacheKey)
+      if (cached) {
+        const result = JSON.parse(cached.data) as StreamResult
+        if (result.success) {
+          console.log(`[Stream API] Per-source KV HIT: ${sourceCacheKey} (age: ${cached.age}s)`)
+          // Stale-while-revalidate: if >10 min old, refresh in background
+          if (cached.age > STALE_WHILE_REVALIDATE) {
+            refreshSourceInBackground(sourceConfig, tmdbIdParam, type, season, episode, sourceCacheKey)
+          }
+          return buildCachedResponse(result, 'HIT-KV', cached.age.toString())
+        }
+      }
+    }
+
+    // Cache miss or nocache — fetch fresh
+    console.log(`[Stream API] Per-source ${nocache ? 'NOCACHE' : 'MISS'}: ${sourceCacheKey}`)
     let result: StreamResult
 
     if (sourceConfig.apiOrigin === 'missourimonster') {
-      result = await fetchMissouriMonster(
-        sourceConfig.apiSourceKey,
-        tmdbIdParam,
-        type,
-        season,
-        episode
-      )
+      result = await fetchMissouriMonster(sourceConfig.apiSourceKey, tmdbIdParam, type, season, episode)
     } else {
-      result = await fetchStreamForge(
-        sourceConfig.apiSourceKey,
-        tmdbIdParam,
-        type,
-        season,
-        episode
-      )
+      result = await fetchStreamForge(sourceConfig.apiSourceKey, tmdbIdParam, type, season, episode)
     }
 
-    return NextResponse.json(result)
+    // Cache successful results
+    if (result.success) {
+      await kvPut(sourceCacheKey, JSON.stringify(result), KV_TTL_PER_SOURCE)
+      console.log(`[Stream API] Cached per-source: ${sourceCacheKey}`)
+    }
+
+    return NextResponse.json(result, {
+      headers: { 'X-Cache': nocache ? 'NOCACHE' : 'MISS' },
+    })
   }
 
   // ─── Mode 2: Combined fetch (embed mode) ─────────────────────────────────
@@ -943,18 +986,26 @@ export async function GET(request: NextRequest) {
 
   const season = searchParams.get('season') || '1'
   const episode = searchParams.get('episode') || '1'
-  const cacheKey = buildCacheKey(type, id, season, episode)
+  const cacheKey = `cmb:${type}:${id}:${season}:${episode}`
 
-  // Check in-memory cache
-  const memCached = getMemoryCache(cacheKey)
-  if (memCached && memCached.sources && memCached.sources.length > 0) {
-    const cacheAgeSec = Math.floor((Date.now() - (memoryCache.get(cacheKey)?.timestamp || 0)) / 1000)
-    console.log(`[Stream API] Memory cache HIT: ${cacheKey} (age: ${cacheAgeSec}s)`)
-    return buildCachedResponse(memCached, 'HIT-MEMORY', cacheAgeSec.toString())
+  // Check KV cache (unless nocache=1)
+  if (!nocache) {
+    const cached = await kvGet(cacheKey)
+    if (cached) {
+      const cachedData = JSON.parse(cached.data) as StreamData
+      if (cachedData.sources && cachedData.sources.length > 0) {
+        console.log(`[Stream API] Combined KV HIT: ${cacheKey} (age: ${cached.age}s)`)
+        // Stale-while-revalidate: if >10 min old, refresh in background
+        if (cached.age > STALE_WHILE_REVALIDATE) {
+          refreshCombinedInBackground(type, id, season, episode, cacheKey)
+        }
+        return buildCachedResponse(cachedData, 'HIT-KV', cached.age.toString())
+      }
+    }
   }
 
-  // Cache miss — fetch from BOTH APIs in parallel
-  console.log(`[Stream API] Cache MISS: ${cacheKey} — fetching from both APIs in parallel`)
+  // Cache miss or nocache — fetch from BOTH APIs in parallel
+  console.log(`[Stream API] Combined ${nocache ? 'NOCACHE' : 'MISS'}: ${cacheKey} — fetching from both APIs`)
 
   const withTimeout = <T>(promise: Promise<T | null>, ms: number, label: string): Promise<T | null> => {
     const timer = new Promise<null>((resolve) => setTimeout(() => {
@@ -1025,9 +1076,79 @@ export async function GET(request: NextRequest) {
     subtitles: dedupedSubs,
   }
 
-  // Save to in-memory cache
-  setMemoryCache(cacheKey, mergedData)
-  console.log(`[Stream API] Cached: ${cacheKey} (${allSources.length} sources)`)
+  // Save to KV cache
+  await kvPut(cacheKey, JSON.stringify(mergedData), KV_TTL_COMBINED)
+  console.log(`[Stream API] Cached combined: ${cacheKey} (${allSources.length} sources)`)
 
-  return buildCachedResponse(mergedData, 'MISS', '0')
+  return buildCachedResponse(mergedData, nocache ? 'NOCACHE' : 'MISS', '0')
+}
+
+// ─── Background Refresh Functions ───────────────────────────────────────────
+// These fire-and-forget functions refresh stale cache entries in the background
+// without blocking the response. The user gets the cached data instantly.
+
+function refreshCombinedInBackground(type: string, id: string, season: string, episode: string, cacheKey: string) {
+  // Fire and forget — don't await
+  ;(async () => {
+    try {
+      console.log(`[Stream API] Background refresh: ${cacheKey}`)
+      const [mmData, sfData] = await Promise.all([
+        fetchMissourimonsterCombined(type, id, season, episode),
+        fetchStreamForgeCombined(type, id, season, episode),
+      ])
+
+      const mmSources: StreamSource[] = (mmData?.sources || []).map((s: StreamSource) => ({
+        ...s, language: s.language || undefined, quality: s.quality || undefined,
+      }))
+      const sfSources: StreamSource[] = sfData?.sources || []
+      const subtitles: StreamSubtitle[] = [...(mmData?.subtitles || []), ...(sfData?.subtitles || [])]
+
+      const seenSubs = new Set<string>()
+      const dedupedSubs = subtitles.filter(sub => {
+        const key = sub.label.toLowerCase().replace(/\d+/g, '').trim()
+        if (seenSubs.has(key)) return false
+        seenSubs.add(key)
+        return true
+      })
+
+      const seenUrls = new Set<string>()
+      const allSources: StreamSource[] = []
+      for (const s of sfSources) {
+        const urlKey = s.url.toLowerCase().trim()
+        if (!seenUrls.has(urlKey)) { seenUrls.add(urlKey); allSources.push(s) }
+      }
+      for (const s of mmSources) {
+        const urlKey = s.url.toLowerCase().trim()
+        if (!seenUrls.has(urlKey)) { seenUrls.add(urlKey); allSources.push(s) }
+      }
+
+      if (allSources.length > 0) {
+        const mergedData: StreamData = { sources: allSources, subtitles: dedupedSubs }
+        await kvPut(cacheKey, JSON.stringify(mergedData), KV_TTL_COMBINED)
+        console.log(`[Stream API] Background refresh done: ${cacheKey} (${allSources.length} sources)`)
+      }
+    } catch (e) {
+      console.warn(`[Stream API] Background refresh failed: ${cacheKey}`, e)
+    }
+  })()
+}
+
+function refreshSourceInBackground(sourceConfig: any, tmdbId: string, type: string, season: string, episode: string, cacheKey: string) {
+  ;(async () => {
+    try {
+      console.log(`[Stream API] Background refresh per-source: ${cacheKey}`)
+      let result: StreamResult
+      if (sourceConfig.apiOrigin === 'missourimonster') {
+        result = await fetchMissouriMonster(sourceConfig.apiSourceKey, tmdbId, type, season, episode)
+      } else {
+        result = await fetchStreamForge(sourceConfig.apiSourceKey, tmdbId, type, season, episode)
+      }
+      if (result.success) {
+        await kvPut(cacheKey, JSON.stringify(result), KV_TTL_PER_SOURCE)
+        console.log(`[Stream API] Background refresh done per-source: ${cacheKey}`)
+      }
+    } catch (e) {
+      console.warn(`[Stream API] Background refresh failed per-source: ${cacheKey}`, e)
+    }
+  })()
 }

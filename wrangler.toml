@@ -2,3 +2,7 @@ name = "fireflixplayer"
 compatibility_date = "2025-04-23"
 compatibility_flags = ["nodejs_compat"]
 pages_build_output_dir = ".vercel/output/static"
+
+[[kv_namespaces]]
+binding = "M3U8_CACHE"
+id = "0580caf099a343f8954668608aeb2b49"
