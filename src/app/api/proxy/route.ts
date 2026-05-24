@@ -1,5 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 
+export const runtime = 'edge';
+
 // ─── Hybrid proxy for Cloudflare Pages deployment ────────────────────────────
 //
 // ROUTING STRATEGY (adapted for CF Pages where Workers' IPs are blocked):

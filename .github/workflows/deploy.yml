@@ -20,8 +20,8 @@ jobs:
       - name: Install dependencies
         run: bun install
 
-      - name: Build with OpenNext for Cloudflare
-        run: npx opennextjs-cloudflare build
+      - name: Build with @cloudflare/next-on-pages
+        run: npx @cloudflare/next-on-pages
         env:
           TMDB_API_KEY: ${{ secrets.TMDB_API_KEY || '7967738a03ec215c7d6d675faba9c973' }}
 
@@ -30,4 +30,4 @@ jobs:
         with:
           apiToken: ${{ secrets.CF_API_TOKEN }}
           accountId: db18b7bbe7cad3a8e87df146c0516b7d
-          command: pages deploy .open-next/assets --project-name=fireflixplayer
+          command: pages deploy .vercel/output/static --project-name=fireflixplayer

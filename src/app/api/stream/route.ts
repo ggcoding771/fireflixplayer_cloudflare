@@ -2,6 +2,8 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getSourceById } from '@/lib/sources';
 import { parseM3U8, detectCastleLanguages, generateFlagsFromLangs, type AudioTrack, type QualityLevel } from '@/lib/m3u8-parser';
 
+export const runtime = 'edge';
+
 const MM_BASE = 'https://missourimonster-vyla.hf.space';
 const SF_BASE = 'https://epiccodergg-streamforge-api.hf.space';
 
