@@ -67,9 +67,11 @@ function EmbedModePlayer({
   const [playerCurrentTime, setPlayerCurrentTime] = useState(0);
   const [playerDuration, setPlayerDuration] = useState(0);
 
-  // Preserved timestamp for source switching — when the source changes,
-  // we save the current time so the new source can seek to the same position
-  const [preservedSeekTime, setPreservedSeekTime] = useState<number | null>(null);
+  // Timestamp tracking for source switching — use a ref for the current time
+  // (no re-renders) and only set state when actually switching sources.
+  // Using state for onTimeUpdate caused constant re-renders → flickering/stuttering.
+  const lastTimestampRef = useRef<number>(0);
+  const [pendingSeekTime, setPendingSeekTime] = useState<number | null>(null);
 
   // Current episode state (mutable for next episode navigation)
   const [currentSeason, setCurrentSeason] = useState(season);
@@ -95,6 +97,12 @@ function EmbedModePlayer({
     let cancelled = false;
 
     const fetchStreams = async () => {
+      // Save current timestamp before resetting (for source/episode switches)
+      if (lastTimestampRef.current > 5) {
+        setPendingSeekTime(lastTimestampRef.current);
+        console.log(`[EmbedModePlayer] Preserving timestamp: ${lastTimestampRef.current}s`);
+      }
+
       setLoading(true);
       setError(null);
       setStreamData(null);
@@ -288,17 +296,16 @@ function EmbedModePlayer({
               url={currentSource?.url || null}
               qualities={[]}
               audioTracks={[]}
-              initialSeekTime={preservedSeekTime}
+              initialSeekTime={pendingSeekTime}
               onHlsError={handleHlsError}
               onTimeUpdate={(time) => {
                 setPlayerCurrentTime(time);
-                // Update preserved time so it's always current
-                setPreservedSeekTime(time);
+                // Update ref only — NO state update to avoid re-render every frame
+                lastTimestampRef.current = time;
               }}
               onSeeked={() => {
-                // Clear preserved seek time after it's been applied
-                // (keep it for 2s in case the player needs it again)
-                setTimeout(() => setPreservedSeekTime(null), 2000);
+                // Clear pending seek time after it's been applied
+                setTimeout(() => setPendingSeekTime(null), 2000);
               }}
               season={currentSeason}
               episode={currentEpisode}
