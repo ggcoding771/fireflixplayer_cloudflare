@@ -20,9 +20,15 @@ interface ArtPlayerWrapperProps {
   qualities: QualityLevel[];
   audioTracks: AudioTrack[];
   desiredAudioLanguage?: string;
+  /** Seek to this time (in seconds) after the source loads — used to preserve position on source switch */
+  initialSeekTime?: number | null;
   onAudioTrackChange?: (track: AudioTrack) => void;
   onHlsError?: () => void;
   onManifestParsed?: (data: { qualities: QualityLevel[]; audioTracks: AudioTrack[]; subtitleTracks: SubtitleTrack[] }) => void;
+  /** Called on every timeupdate with the current playback time (seconds) */
+  onTimeUpdate?: (time: number) => void;
+  /** Called when a seek operation completes */
+  onSeeked?: () => void;
   /** External VTT/SRT subtitle URLs (e.g. from MissouriMonster) */
   externalSubtitles?: SubtitleTrack[];
   /** Season number for postMessage reporting */
@@ -124,9 +130,12 @@ export function ArtPlayerWrapper({
   qualities: _qualities,
   audioTracks: _audioTracks,
   desiredAudioLanguage,
+  initialSeekTime,
   onAudioTrackChange,
   onHlsError,
   onManifestParsed,
+  onTimeUpdate,
+  onSeeked,
   externalSubtitles,
   season,
   episode,
@@ -176,6 +185,21 @@ export function ArtPlayerWrapper({
   useEffect(() => {
     externalSubtitlesRef.current = externalSubtitles;
   }, [externalSubtitles]);
+
+  const onTimeUpdateRef = useRef(onTimeUpdate);
+  useEffect(() => {
+    onTimeUpdateRef.current = onTimeUpdate;
+  }, [onTimeUpdate]);
+
+  const onSeekedRef = useRef(onSeeked);
+  useEffect(() => {
+    onSeekedRef.current = onSeeked;
+  }, [onSeeked]);
+
+  const initialSeekTimeRef = useRef(initialSeekTime);
+  useEffect(() => {
+    initialSeekTimeRef.current = initialSeekTime;
+  }, [initialSeekTime]);
 
   const seasonRef = useRef(season);
   useEffect(() => { seasonRef.current = season }, [season]);
@@ -376,6 +400,9 @@ export function ArtPlayerWrapper({
     // ─── PostMessage progress reporting ─────────────────────────────────
     art.on('video:timeupdate', () => {
       if (art.duration > 0) {
+        // Report current time to parent via onTimeUpdate callback
+        onTimeUpdateRef.current?.(art.currentTime);
+
         try {
           window.parent.postMessage({
             type: 'PLAYER_EVENT',
@@ -390,6 +417,11 @@ export function ArtPlayerWrapper({
           // postMessage may fail in some contexts
         }
       }
+    });
+
+    // ─── Seeked event ───────────────────────────────────────────────────────
+    art.on('video:seeked', () => {
+      onSeekedRef.current?.();
     });
 
     if (!url) return;
@@ -418,6 +450,19 @@ export function ArtPlayerWrapper({
         art.video.play().catch(() => {
           // Autoplay blocked
         });
+
+        // Seek to preserved timestamp after source switch
+        const seekTime = initialSeekTimeRef.current;
+        if (seekTime && seekTime > 0) {
+          console.log(`[ArtPlayerWrapper] Seeking to preserved timestamp: ${seekTime}s`);
+          // Wait a tick for the video to be ready before seeking
+          art.on('video:canplay', function seekOnReady() {
+            art.off('video:canplay', seekOnReady);
+            if (seekTime <= art.duration) {
+              art.currentTime = seekTime;
+            }
+          });
+        }
 
         // Apply desired audio language if specified
         const currentDesiredLang = desiredAudioLanguageRef.current;
@@ -785,8 +830,28 @@ export function ArtPlayerWrapper({
 
     } else if (isHls && art.video.canPlayType('application/vnd.apple.mpegurl')) {
       art.video.src = url;
+      // Seek to preserved timestamp for Safari native HLS
+      const seekTime = initialSeekTimeRef.current;
+      if (seekTime && seekTime > 0) {
+        art.on('video:canplay', function seekOnReady() {
+          art.off('video:canplay', seekOnReady);
+          if (seekTime <= art.duration) {
+            art.currentTime = seekTime;
+          }
+        });
+      }
     } else if (!isHls) {
       art.url = url;
+      // Seek to preserved timestamp for direct MP4 playback
+      const seekTime = initialSeekTimeRef.current;
+      if (seekTime && seekTime > 0) {
+        art.on('video:canplay', function seekOnReady() {
+          art.off('video:canplay', seekOnReady);
+          if (seekTime <= art.duration) {
+            art.currentTime = seekTime;
+          }
+        });
+      }
     }
   }, [url, desiredAudioLanguage, applyDesiredAudioLanguage]);
 

@@ -65,6 +65,8 @@ export function EmbedPlayer({ tmdbId, type, season, episode }: EmbedPlayerProps)
   const autoPlayIndexRef = useRef(0);
   const pendingAutoPlayRef = useRef<number | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
+  const lastTimestampRef = useRef<number>(0);
+  const pendingSeekTimeRef = useRef<number | null>(null);
 
   const sourceStatusesRef = useRef<Record<string, SourceStatus>>({});
   useEffect(() => {
@@ -135,12 +137,20 @@ export function EmbedPlayer({ tmdbId, type, season, episode }: EmbedPlayerProps)
     const url = overrideUrl || status?.streamUrl;
     if (!url) return;
 
+    // Save current timestamp before switching (if we have an active source)
+    if (activeSourceId && activeSourceId !== sourceId) {
+      if (lastTimestampRef.current > 5) {
+        pendingSeekTimeRef.current = lastTimestampRef.current;
+        console.log(`[EmbedPlayer] Saving timestamp: ${lastTimestampRef.current}s for source switch`);
+      }
+    }
+
     setActiveSourceId(sourceId);
     setActiveStreamUrl(url);
     setActiveHeaders(status?.headers);
     setDesiredAudioLanguage(undefined);
     setLoading(false);
-  }, []);
+  }, [activeSourceId]);
 
   const tryAutoPlay = useCallback(async (sourceList: SourceInfo[], startIndex: number) => {
     autoPlayAbortedRef.current = false;
@@ -279,6 +289,13 @@ export function EmbedPlayer({ tmdbId, type, season, episode }: EmbedPlayerProps)
 
   const handleSelectSubStream = useCallback((sourceId: string, streamUrl: string, _streamTitle: string, desiredLanguage?: string) => {
     autoPlayAbortedRef.current = true;
+
+    // Save current timestamp before switching substream
+    if (activeSourceId && lastTimestampRef.current > 5) {
+      pendingSeekTimeRef.current = lastTimestampRef.current;
+      console.log(`[EmbedPlayer] Saving timestamp: ${lastTimestampRef.current}s for substream switch`);
+    }
+
     setActiveSourceId(sourceId);
     setActiveStreamUrl(streamUrl);
     setDesiredAudioLanguage(desiredLanguage);
@@ -288,10 +305,14 @@ export function EmbedPlayer({ tmdbId, type, season, episode }: EmbedPlayerProps)
     if (status?.headers) {
       setActiveHeaders(status.headers);
     }
-  }, []);
+  }, [activeSourceId]);
 
   const handleAudioTrackChange = useCallback((_track: AudioTrack) => {
     // Track change is handled by HLS.js internally
+  }, []);
+
+  const handleTimeUpdate = useCallback((time: number) => {
+    lastTimestampRef.current = time;
   }, []);
 
   const handleManifestParsed = useCallback((data: { qualities: QualityLevel[]; audioTracks: AudioTrack[]; subtitleTracks?: SubtitleTrack[] }) => {
@@ -337,9 +358,12 @@ export function EmbedPlayer({ tmdbId, type, season, episode }: EmbedPlayerProps)
           qualities={[]}
           audioTracks={[]}
           desiredAudioLanguage={desiredAudioLanguage}
+          initialSeekTime={pendingSeekTimeRef.current}
           onAudioTrackChange={handleAudioTrackChange}
           onHlsError={handleHlsError}
           onManifestParsed={handleManifestParsed}
+          onTimeUpdate={handleTimeUpdate}
+          onSeeked={() => { pendingSeekTimeRef.current = null; }}
           externalSubtitles={activeSourceId ? sourceStatuses[activeSourceId]?.subtitles || [] : []}
         />
       </div>
