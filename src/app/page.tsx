@@ -67,11 +67,11 @@ function EmbedModePlayer({
   const [playerCurrentTime, setPlayerCurrentTime] = useState(0);
   const [playerDuration, setPlayerDuration] = useState(0);
 
-  // Timestamp tracking for source switching — use a ref for the current time
-  // (no re-renders) and only set state when actually switching sources.
-  // Using state for onTimeUpdate caused constant re-renders → flickering/stuttering.
-  const lastTimestampRef = useRef<number>(0);
-  const [pendingSeekTime, setPendingSeekTime] = useState<number | null>(null);
+  // Player time tracking — use refs to avoid re-renders on every frame.
+  // Only update state at a throttled rate for IntroSkipOverlay.
+  const playerCurrentTimeRef = useRef<number>(0);
+  const playerDurationRef = useRef<number>(0);
+  const lastTimeUpdateRef = useRef<number>(0);
 
   // Current episode state (mutable for next episode navigation)
   const [currentSeason, setCurrentSeason] = useState(season);
@@ -97,12 +97,6 @@ function EmbedModePlayer({
     let cancelled = false;
 
     const fetchStreams = async () => {
-      // Save current timestamp before resetting (for source/episode switches)
-      if (lastTimestampRef.current > 5) {
-        setPendingSeekTime(lastTimestampRef.current);
-        console.log(`[EmbedModePlayer] Preserving timestamp: ${lastTimestampRef.current}s`);
-      }
-
       setLoading(true);
       setError(null);
       setStreamData(null);
@@ -219,8 +213,13 @@ function EmbedModePlayer({
       // Handle PLAYER_EVENT from ArtPlayerWrapper (time/duration updates)
       if (event.data.type === 'PLAYER_EVENT' && event.data.data) {
         const d = event.data.data;
-        if (d?.currentTime !== undefined) setPlayerCurrentTime(Number(d.currentTime));
-        if (d?.duration !== undefined && Number(d.duration) > 0) setPlayerDuration(Number(d.duration));
+        // Update refs on every message (no re-render)
+        if (d?.currentTime !== undefined) playerCurrentTimeRef.current = Number(d.currentTime);
+        if (d?.duration !== undefined && Number(d.duration) > 0) {
+          playerDurationRef.current = Number(d.duration);
+          // Duration changes rarely, safe to update state
+          setPlayerDuration(Number(d.duration));
+        }
         return;
       }
 
@@ -296,16 +295,16 @@ function EmbedModePlayer({
               url={currentSource?.url || null}
               qualities={[]}
               audioTracks={[]}
-              initialSeekTime={pendingSeekTime}
               onHlsError={handleHlsError}
               onTimeUpdate={(time) => {
-                setPlayerCurrentTime(time);
-                // Update ref only — NO state update to avoid re-render every frame
-                lastTimestampRef.current = time;
-              }}
-              onSeeked={() => {
-                // Clear pending seek time after it's been applied
-                setTimeout(() => setPendingSeekTime(null), 2000);
+                // Update ref on every frame (no re-render)
+                playerCurrentTimeRef.current = time;
+                // Throttle state update to once per second for IntroSkipOverlay
+                const now = Date.now();
+                if (now - lastTimeUpdateRef.current >= 1000) {
+                  lastTimeUpdateRef.current = now;
+                  setPlayerCurrentTime(time);
+                }
               }}
               season={currentSeason}
               episode={currentEpisode}
@@ -403,6 +402,9 @@ function StandaloneModePlayer({
   const [autoSkipOutroState, setAutoSkipOutroState] = useState(autoSkipOutro);
   const [autoPlayNextState, setAutoPlayNextState] = useState(autoPlayNext);
 
+  // Throttle time updates to avoid re-rendering every frame
+  const lastTimeUpdateRef = useRef<number>(0);
+
   // Clear segments when imdbId is missing
   const clearedSegments = !imdbId;
 
@@ -458,7 +460,14 @@ function StandaloneModePlayer({
 
       // Handle PLAYER_EVENT from ArtPlayerWrapper (time/duration updates)
       if (raw.type === 'PLAYER_EVENT' && raw.data) {
-        if (raw.data.currentTime !== undefined) setPlayerCurrentTime(Number(raw.data.currentTime));
+        // Throttle currentTime updates to once per second
+        if (raw.data.currentTime !== undefined) {
+          const now = Date.now();
+          if (now - lastTimeUpdateRef.current >= 1000) {
+            lastTimeUpdateRef.current = now;
+            setPlayerCurrentTime(Number(raw.data.currentTime));
+          }
+        }
         if (raw.data.duration !== undefined && Number(raw.data.duration) > 0) setPlayerDuration(Number(raw.data.duration));
         return;
       }
