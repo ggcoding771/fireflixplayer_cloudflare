@@ -827,7 +827,7 @@ async function fetchStreamForge(
 
 // ─── Combined mode: Fetch all sources from both APIs ──────────────────────────
 
-async function fetchMissourimonsterCombined(type: string, tmdbId: string, season: string, episode: string): Promise<StreamData | null> {
+async function fetchMissourimonsterCombined(type: string, tmdbId: string, season: string, episode: string, externalSignal?: AbortSignal): Promise<StreamData | null> {
   try {
     let url: string
     if (type === 'tv') {
@@ -837,7 +837,12 @@ async function fetchMissourimonsterCombined(type: string, tmdbId: string, season
     }
 
     const controller = new AbortController()
-    const timeout = setTimeout(() => controller.abort(), 15000)
+    const timeout = setTimeout(() => controller.abort(), 12000)
+    // Also abort if the external signal (from fetchWithTimeout) fires
+    if (externalSignal) {
+      if (externalSignal.aborted) { controller.abort() }
+      else { externalSignal.addEventListener('abort', () => controller.abort(), { once: true }) }
+    }
 
     const response = await fetch(url, {
       signal: controller.signal,
@@ -859,7 +864,7 @@ async function fetchMissourimonsterCombined(type: string, tmdbId: string, season
   }
 }
 
-async function fetchStreamForgeCombined(type: string, tmdbId: string, season: string, episode: string): Promise<StreamData | null> {
+async function fetchStreamForgeCombined(type: string, tmdbId: string, season: string, episode: string, externalSignal?: AbortSignal): Promise<StreamData | null> {
   try {
     let url: string
     if (type === 'tv') {
@@ -869,7 +874,12 @@ async function fetchStreamForgeCombined(type: string, tmdbId: string, season: st
     }
 
     const controller = new AbortController()
-    const timeout = setTimeout(() => controller.abort(), 20000)
+    const timeout = setTimeout(() => controller.abort(), 15000)
+    // Also abort if the external signal (from fetchWithTimeout) fires
+    if (externalSignal) {
+      if (externalSignal.aborted) { controller.abort() }
+      else { externalSignal.addEventListener('abort', () => controller.abort(), { once: true }) }
+    }
 
     const response = await fetch(url, {
       signal: controller.signal,
@@ -953,6 +963,18 @@ function buildNoCacheResponse(data: any, status: number): NextResponse {
 // ─── Main Handler ─────────────────────────────────────────────────────────────
 
 export async function GET(request: NextRequest) {
+  try {
+  return await _GET(request)
+  } catch (err) {
+    console.error('[Stream API] Unhandled error in GET handler:', err)
+    return NextResponse.json(
+      { error: 'Streams are loading. Please try again in a moment.', sources: [], subtitles: [] },
+      { status: 504, headers: { 'Cache-Control': 'no-store' } }
+    )
+  }
+}
+
+async function _GET(request: NextRequest) {
   const searchParams = request.nextUrl.searchParams
   const nocache = searchParams.get('nocache') === '1'
 
@@ -1046,17 +1068,50 @@ export async function GET(request: NextRequest) {
   // Cache miss or nocache — fetch from BOTH APIs in parallel
   console.log(`[Stream API] Combined ${nocache ? 'NOCACHE' : 'MISS'}: ${cacheKey} — fetching from both APIs`)
 
-  const withTimeout = <T>(promise: Promise<T | null>, ms: number, label: string): Promise<T | null> => {
-    const timer = new Promise<null>((resolve) => setTimeout(() => {
-      console.log(`[Stream API] ${label} timed out after ${ms}ms`)
-      resolve(null)
-    }, ms))
-    return Promise.race([promise, timer])
+  // AbortController-based timeout: actually cancels the fetch when timer fires
+  // so background requests don't keep consuming Worker resources.
+  const fetchWithTimeout = async <T>(
+    fetchFn: (signal: AbortSignal) => Promise<T | null>,
+    ms: number,
+    label: string
+  ): Promise<T | null> => {
+    const controller = new AbortController()
+    const timer = setTimeout(() => {
+      console.log(`[Stream API] ${label} timed out after ${ms}ms — aborting fetch`)
+      controller.abort()
+    }, ms)
+    try {
+      const result = await fetchFn(controller.signal)
+      clearTimeout(timer)
+      return result
+    } catch (err) {
+      clearTimeout(timer)
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        console.log(`[Stream API] ${label} fetch aborted after ${ms}ms timeout`)
+        return null
+      }
+      console.error(`[Stream API] ${label} fetch error:`, err)
+      return null
+    }
   }
 
+  // Warm-up ping: send a quick HEAD request to both HF Spaces to wake them
+  // from cold starts. We don't block on the result — this helps the NEXT request
+  // succeed faster.
+  const warmUpPing = (url: string, label: string) => {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 3000)
+    fetch(url, { method: 'HEAD', signal: controller.signal, cache: 'no-store' })
+      .then(() => clearTimeout(timer))
+      .catch(() => { clearTimeout(timer) })
+    console.log(`[Stream API] Warm-up ping sent to ${label}`)
+  }
+  warmUpPing(MM_BASE, 'missourimonster')
+  warmUpPing(SF_BASE, 'StreamForge')
+
   const [mmData, sfData] = await Promise.all([
-    withTimeout(fetchMissourimonsterCombined(type, id, season, episode), 18000, 'missourimonster'),
-    withTimeout(fetchStreamForgeCombined(type, id, season, episode), 20000, 'StreamForge'),
+    fetchWithTimeout((signal) => fetchMissourimonsterCombined(type, id, season, episode, signal), 12000, 'missourimonster'),
+    fetchWithTimeout((signal) => fetchStreamForgeCombined(type, id, season, episode, signal), 15000, 'StreamForge'),
   ])
 
   // Merge sources — StreamForge FIRST, then missourimonster
@@ -1105,8 +1160,8 @@ export async function GET(request: NextRequest) {
 
   if (allSources.length === 0) {
     return buildNoCacheResponse(
-      { error: 'No streams available', sources: [], subtitles: [] },
-      502
+      { error: 'Streams are loading. Please try again in a moment.', sources: [], subtitles: [] },
+      504
     )
   }
 
@@ -1120,7 +1175,7 @@ export async function GET(request: NextRequest) {
   console.log(`[Stream API] Cached combined: ${cacheKey} (${allSources.length} sources)`)
 
   return buildCachedResponse(mergedData, nocache ? 'NOCACHE' : 'MISS', '0')
-}
+} // end _GET
 
 // ─── Background Refresh Functions ───────────────────────────────────────────
 // These fire-and-forget functions refresh stale cache entries in the background
