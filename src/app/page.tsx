@@ -67,6 +67,10 @@ function EmbedModePlayer({
   const [playerCurrentTime, setPlayerCurrentTime] = useState(0);
   const [playerDuration, setPlayerDuration] = useState(0);
 
+  // Preserved timestamp for source switching — when the source changes,
+  // we save the current time so the new source can seek to the same position
+  const [preservedSeekTime, setPreservedSeekTime] = useState<number | null>(null);
+
   // Current episode state (mutable for next episode navigation)
   const [currentSeason, setCurrentSeason] = useState(season);
   const [currentEpisode, setCurrentEpisode] = useState(episode);
@@ -284,7 +288,18 @@ function EmbedModePlayer({
               url={currentSource?.url || null}
               qualities={[]}
               audioTracks={[]}
+              initialSeekTime={preservedSeekTime}
               onHlsError={handleHlsError}
+              onTimeUpdate={(time) => {
+                setPlayerCurrentTime(time);
+                // Update preserved time so it's always current
+                setPreservedSeekTime(time);
+              }}
+              onSeeked={() => {
+                // Clear preserved seek time after it's been applied
+                // (keep it for 2s in case the player needs it again)
+                setTimeout(() => setPreservedSeekTime(null), 2000);
+              }}
               season={currentSeason}
               episode={currentEpisode}
             />
