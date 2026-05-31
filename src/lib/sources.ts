@@ -116,7 +116,7 @@ export const SOURCES: SourceConfig[] = [
     reliability: 'medium',
     note: 'Partially working — purstream works, klikxxi times out',
   },
-  // === 5. Titan (MM vidrock) — Working via MissouriMonster ===
+  // === 5. Titan (MM vidrock) — Working via local proxy ===
   {
     id: 'mm-vidrock',
     name: 'Titan',
@@ -126,11 +126,11 @@ export const SOURCES: SourceConfig[] = [
     languages: ['en'],
     order: 5,
     reliability: 'high',
-    note: 'Slow (~12s) but reliable via MM proxy',
+    note: 'Slow (~12s) but reliable — raw URL through local proxy with vidrock.ru headers',
   },
   // === 6. VidApi (Vega) — Direct provider, multiple m3u8 URLs ===
-  // Returns multiple m3u8 URLs from different CDNs. Some CDNs are CF-blocked,
-  // but the API itself works reliably. Player tries each URL until one works.
+  // Returns multiple m3u8 URLs from CF-protected CDNs. Routed through HF proxy.
+  // CDN domains (creativeautomationlab.site, tmstrd.justhd.tv) block datacenter IPs.
   {
     id: 'direct-vidapi',
     name: 'Vega',
@@ -140,7 +140,7 @@ export const SOURCES: SourceConfig[] = [
     languages: ['en'],
     order: 6,
     reliability: 'medium',
-    note: 'Direct API — returns multiple CDN URLs, some may be CF-blocked',
+    note: 'VidApi CDNs are CF-protected — routed through HF proxy',
   },
 ];
 

@@ -107,6 +107,21 @@ function isCastleCDN(url: string): boolean {
   }
 }
 
+/** Check if a URL points to a VidApi CDN (CF-protected) */
+function isVidApiCDN(url: string): boolean {
+  try {
+    const hostname = new URL(url).hostname.toLowerCase();
+    const vidApiDomains = [
+      'creativeautomationlab.site',
+      'tmstrd.justhd.tv',
+      'justhd.tv',
+    ];
+    return vidApiDomains.some(d => hostname === d || hostname.endsWith('.' + d));
+  } catch {
+    return false;
+  }
+}
+
 export async function GET(request: NextRequest) {
   const searchParams = request.nextUrl.searchParams;
   const targetUrl = searchParams.get('url');
@@ -325,9 +340,10 @@ async function rewriteM3U8(content: string, baseUrl: string, searchParams: URLSe
   const origin = searchParams.get('origin') || '';
   const localProxyBase = '/api/proxy';
 
-  // Detect Castle/freecdn URLs
+  // Detect Castle/freecdn/VidApi URLs
   let hasCastleUrls = false;
   let hasFreecdnUrls = false;
+  let hasVidApiUrls = false;
   for (const line of lines) {
     const trimmed = line.trim();
     if (trimmed === '' || trimmed.startsWith('#')) continue;
@@ -335,6 +351,7 @@ async function rewriteM3U8(content: string, baseUrl: string, searchParams: URLSe
     const resolved = resolveUrl(trimmed, baseUrl);
     if (isFreecdnCDN(resolved)) hasFreecdnUrls = true;
     if (isCastleCDN(resolved)) hasCastleUrls = true;
+    if (isVidApiCDN(resolved)) hasVidApiUrls = true;
 
     if (trimmed.includes('URI="')) {
       const uriMatch = trimmed.match(/URI="([^"]+)"/);
@@ -342,12 +359,14 @@ async function rewriteM3U8(content: string, baseUrl: string, searchParams: URLSe
         const uriResolved = resolveUrl(uriMatch[1], baseUrl);
         if (isFreecdnCDN(uriResolved)) hasFreecdnUrls = true;
         if (isCastleCDN(uriResolved)) hasCastleUrls = true;
+        if (isVidApiCDN(uriResolved)) hasVidApiUrls = true;
       }
     }
   }
 
   if (hasFreecdnUrls) console.log(`[Proxy] Detected freecdn CDN URLs — routing through HF proxy`);
   if (hasCastleUrls) console.log(`[Proxy] Detected Castle CDN URLs — routing through HF proxy (CF Workers blocked)`);
+  if (hasVidApiUrls) console.log(`[Proxy] Detected VidApi CDN URLs — routing through HF proxy (CF-protected)`);
 
   return lines.map(line => {
     const trimmed = line.trim();
@@ -358,7 +377,7 @@ async function rewriteM3U8(content: string, baseUrl: string, searchParams: URLSe
         return trimmed.replace(/URI="([^"]+)"/g, (_match, uri: string) => {
           const resolved = resolveUrl(uri, baseUrl);
 
-          if (isFreecdnCDN(resolved) || isCastleCDN(resolved)) {
+          if (isFreecdnCDN(resolved) || isCastleCDN(resolved) || isVidApiCDN(resolved)) {
             return `URI="${buildHFProxyUrl(resolved, referer, origin)}"`;
           }
 
@@ -370,8 +389,8 @@ async function rewriteM3U8(content: string, baseUrl: string, searchParams: URLSe
 
     const resolved = resolveUrl(trimmed, baseUrl);
 
-    // freecdn and Castle URLs → HF proxy
-    if (isFreecdnCDN(resolved) || isCastleCDN(resolved)) {
+    // freecdn, Castle, and VidApi URLs → HF proxy
+    if (isFreecdnCDN(resolved) || isCastleCDN(resolved) || isVidApiCDN(resolved)) {
       return buildHFProxyUrl(resolved, referer, origin);
     }
 

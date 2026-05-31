@@ -197,10 +197,28 @@ function isFreecdnCDN(url: string): boolean {
   }
 }
 
+/**
+ * Check if a URL points to a VidApi CDN (CF-protected, blocks datacenter IPs).
+ * VidApi returns M3U8 URLs from CDNs like creativeautomationlab.site and
+ * tmstrd.justhd.tv which are behind Cloudflare bot protection.
+ */
+function isVidApiCDN(url: string): boolean {
+  try {
+    const hostname = new URL(url).hostname.toLowerCase();
+    const vidApiDomains = [
+      'creativeautomationlab.site',
+      'tmstrd.justhd.tv',
+      'justhd.tv',
+    ];
+    return vidApiDomains.some(d => hostname === d || hostname.endsWith('.' + d));
+  } catch {
+    return false;
+  }
+}
 
 function buildProxyUrl(directUrl: string, headers?: Record<string, string>): string {
-  // Castle and freecdn CDNs block CF Workers' IPs — route through HF proxy
-  if (isCastleCDN(directUrl) || isFreecdnCDN(directUrl)) {
+  // Castle, freecdn, and VidApi CDNs block CF Workers' IPs — route through HF proxy
+  if (isCastleCDN(directUrl) || isFreecdnCDN(directUrl) || isVidApiCDN(directUrl)) {
     return buildHFProxyUrl(directUrl, headers);
   }
 
@@ -386,12 +404,25 @@ async function fetchMissouriMonster(
       let qualities: QualityLevel[] = [];
       let subtitles: StreamResult['subtitles'] = [];
 
+      // Use the raw URL instead of the MM proxy URL.
+      // The MM proxy (data.url) works for master M3U8 but breaks on variant playlists
+      // (returns HuggingFace HTML error pages). By routing the raw CDN URL through our
+      // own /api/proxy, we get reliable M3U8 rewriting + segment proxying with CORS.
+      const rawUrl = data.raw_url || data.url;
+      const mmHeaders: Record<string, string> = {
+        Referer: 'https://vidrock.ru/',
+        Origin: 'https://vidrock.ru',
+      };
+
       try {
-        const m3u8Response = await fetch(data.url, { signal: AbortSignal.timeout(10000) });
+        const m3u8Response = await fetch(rawUrl, {
+          headers: mmHeaders,
+          signal: AbortSignal.timeout(10000),
+        });
         if (m3u8Response.ok) {
           const m3u8Content = await m3u8Response.text();
           if (m3u8Content.includes('#EXTM3U')) {
-            const parsed = parseM3U8(m3u8Content, data.url);
+            const parsed = parseM3U8(m3u8Content, rawUrl);
             audioTracks = parsed.audioTracks;
             qualities = parsed.qualities;
           }
@@ -433,18 +464,24 @@ async function fetchMissouriMonster(
         // subtitle fetch failed, continue without
       }
 
+      // Route through local /api/proxy with vidrock.ru headers so the proxy
+      // can fetch M3U8 variants and segments with correct Referer/Origin,
+      // rewrite URLs, and serve everything with CORS headers.
+      const playableUrl = buildProxyUrl(rawUrl, mmHeaders);
+
       return {
         sourceId: `mm-${sourceKey}`,
         sourceName: data.source || sourceKey,
         success: true,
-        url: data.url,
-        rawUrl: data.raw_url,
+        url: playableUrl,
+        rawUrl: rawUrl,
         audioTracks,
         qualities,
         languageFlags: generateFlagsFromLangs(audioTracks.map(t => t.language)),
+        headers: mmHeaders,
         elapsedMs,
         error: null,
-        needsProxy: false,
+        needsProxy: true,
         subtitles: subtitles && subtitles.length > 0 ? subtitles : undefined,
       };
     }
