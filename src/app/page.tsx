@@ -119,6 +119,11 @@ function EmbedModePlayer({
 
         if (!data.sources || data.sources.length === 0) {
           setError('No streams available for this content');
+          // Notify parent
+          try {
+            window.parent.postMessage({ type: 'FIREFLIX_NO_STREAMS' }, '*');
+            window.parent.postMessage({ type: 'noStreams' }, '*');
+          } catch {}
           setLoading(false);
           return;
         }
@@ -246,10 +251,6 @@ function EmbedModePlayer({
     const currentId = currentSource?.source;
     if (!currentId) return;
 
-    // Don't auto-switch sources on playback errors.
-    // The ArtPlayerWrapper already tries 5 network + 3 media recovery attempts
-    // with exponential backoff. If it still fails, auto-switching is jarring.
-    // Just mark as failed and let the user choose.
     setFailedSources(prev => {
       const next = new Set(prev);
       next.add(currentId);
@@ -257,9 +258,21 @@ function EmbedModePlayer({
       return next;
     });
 
-    // Show error but don't auto-switch — user was watching this source
-    setError('Playback error. Try switching to another server or retry.');
-  }, [currentSource?.source]);
+    // Try next source that hasn't failed
+    const nextSource = sortedSources.find(s => !failedSourcesRef.current.has(s.source));
+    if (nextSource) {
+      setCurrentSource(nextSource);
+      setCurrentSourceIndex(sortedSources.indexOf(nextSource));
+      setError(null);
+    } else {
+      setError('All servers failed. Please try again later.');
+      // Notify parent
+      try {
+        window.parent.postMessage({ type: 'FIREFLIX_NO_STREAMS' }, '*');
+        window.parent.postMessage({ type: 'noStreams' }, '*');
+      } catch {}
+    }
+  }, [currentSource?.source, sortedSources]);
 
   // ─── Handle next episode ──────────────────────────────────────────────────
   const handleNextEpisode = useCallback(() => {

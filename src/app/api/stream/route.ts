@@ -199,31 +199,17 @@ function isFreecdnCDN(url: string): boolean {
 
 
 function buildProxyUrl(directUrl: string, headers?: Record<string, string>): string {
-  // Castle and freecdn CDNs block CF Workers' IPs — route through HF proxy
-  if (isCastleCDN(directUrl) || isFreecdnCDN(directUrl)) {
-    return buildHFProxyUrl(directUrl, headers);
-  }
-
-  // Other CDNs: use local proxy
-  const params = new URLSearchParams({ url: directUrl });
-  if (headers?.Referer) params.set('referer', headers.Referer);
-  if (headers?.Origin) params.set('origin', headers.Origin);
-  else if (headers?.Referer) {
-    try {
-      const origin = new URL(headers.Referer).origin;
-      params.set('origin', origin);
-    } catch { /* ignore */ }
-  }
-  return `/api/proxy?${params.toString()}`;
+  // Route ALL stream URLs through HF proxy — CF Workers IPs are blocked by most streaming CDNs.
+  // The local /api/proxy is only used for non-stream content (subtitles, etc.)
+  return buildHFProxyUrl(directUrl, headers);
 }
 
 /**
- * Build a proxy URL through HuggingFace Space for freecdn CDN URLs.
+ * Build a proxy URL through HuggingFace Space.
  *
- * NOTE: This is now only used for the per-source mode where NetMirror streams
- * are directly constructed. In the main flow, the local /api/proxy handles
- * hybrid routing — detecting freecdn*.top URLs in m3u8 playlists and routing
- * them through HF automatically. imgcdn.kim URLs go through local proxy (fast).
+ * ALL stream URLs now go through the HF proxy because CF Workers IPs are
+ * blocked by most streaming CDNs. The local /api/proxy is only used for
+ * non-stream content (subtitles, images) where CORS is the only issue.
  *
  * The HF /proxy endpoint rewrites ALL URLs (m3u8 + segments) to go through itself,
  * so bandwidth flows through HF (free tier, no explicit BW limit).
@@ -746,33 +732,15 @@ async function fetchStreamForge(
         }
       }
 
-      // NetMirror: use local /api/proxy (it auto-routes freecdn*.top through HF)
-      // The local proxy detects freecdn URLs in m3u8 and routes them through HF proxy,
-      // while imgcdn.kim URLs go through local proxy (fast). Best of both worlds.
-      // Other sources: also use local /api/proxy
+      // ALL sources now route through HF proxy via buildProxyUrl
+      // CF Workers IPs are blocked by most streaming CDNs
       const playableUrl = buildProxyUrl(primaryUrl, headers);
 
       if (multiStreams && multiStreams.length > 1) {
         for (const stream of multiStreams) {
-          // All streams use local /api/proxy — it auto-routes freecdn through HF
-          // NetMirror multiStreams built with buildHFProxyUrl above need to switch
-          if (isNetMirror) {
-            // Replace HF proxy URLs with local proxy URLs for the main entry
-            // The local proxy will detect freecdn URLs and route them through HF
-            if (stream.url.startsWith(HF_PROXY_BASE)) {
-              // Extract the original URL from the HF proxy URL
-              const hfUrlMatch = stream.url.match(/[?&]url=([^&]+)/);
-              if (hfUrlMatch) {
-                const originalUrl = decodeURIComponent(hfUrlMatch[1]);
-                stream.url = buildProxyUrl(originalUrl, headers);
-              }
-            } else if (!stream.url.startsWith('/api/proxy')) {
-              stream.url = buildProxyUrl(stream.url, headers);
-            }
-          } else {
-            if (!stream.url.startsWith('/api/proxy')) {
-              stream.url = buildProxyUrl(stream.url, headers);
-            }
+          // All streams go through HF proxy — buildProxyUrl now routes everything via HF
+          if (!stream.url.startsWith(HF_PROXY_BASE)) {
+            stream.url = buildProxyUrl(stream.url, headers);
           }
         }
       }
@@ -914,8 +882,7 @@ async function fetchStreamForgeCombined(type: string, tmdbId: string, season: st
       const quality = parseQuality(r.quality || r.title || '')
 
       // Build proxy URL for StreamForge sources
-      // ALL sources use local /api/proxy — it auto-routes freecdn*.top through HF
-      // imgcdn.kim (fast) stays local, freecdn*.top goes through HF
+      // ALL sources now route through HF proxy — CF Workers IPs are blocked by most CDNs
       const headers: Record<string, string> = {}
       if (r.headers) Object.assign(headers, r.headers)
       const playableUrl = buildProxyUrl(r.url, headers)

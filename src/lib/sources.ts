@@ -57,7 +57,8 @@ export const LANG_FLAGS: Record<string, string> = {
 };
 
 // All sources ordered by m3u8 response speed and playback quality
-// Order: NetMirror (Moon) → Castle → Atlas → Lyra → SF high → SF medium → MM high → MM medium → low
+// Only sources that work from CF Workers are included.
+// Order: NetMirror (Moon) → Atlas → Neptune → Titan
 export const SOURCES: SourceConfig[] = [
   // === 1. NetMirror (Moon) — Top priority, multi-language ===
   {
@@ -70,18 +71,7 @@ export const SOURCES: SourceConfig[] = [
     order: 1,
     reliability: 'high',
   },
-  // === 2. Castle — Second priority, multi-language ===
-  {
-    id: 'sf-castle',
-    name: 'Pluto',
-    apiOrigin: 'streamforge',
-    apiSourceKey: 'castle',
-    languageFlags: '🇺🇸🇮🇳',
-    languages: ['en', 'hi', 'ta', 'te', 'multi'],
-    order: 2,
-    reliability: 'high',
-  },
-  // === 3. Atlas — Third priority, fast English ===
+  // === 2. Atlas — Fast English ===
   {
     id: 'sf-vidrock',
     name: 'Atlas',
@@ -89,44 +79,10 @@ export const SOURCES: SourceConfig[] = [
     apiSourceKey: 'vidrock',
     languageFlags: '🇺🇸',
     languages: ['en'],
-    order: 3,
+    order: 2,
     reliability: 'high',
   },
-  // === 4. Lyra — Fourth priority, fast English ===
-  {
-    id: 'sf-cinesu',
-    name: 'Lyra',
-    apiOrigin: 'streamforge',
-    apiSourceKey: 'cinesu',
-    languageFlags: '🇺🇸',
-    languages: ['en'],
-    order: 4,
-    reliability: 'high',
-  },
-
-  // === StreamForge high-reliability (fast CDN, quick m3u8) ===
-  {
-    id: 'sf-dooflix',
-    name: 'Venus',
-    apiOrigin: 'streamforge',
-    apiSourceKey: 'dooflix',
-    languageFlags: '🇮🇳🇺🇸',
-    languages: ['hi', 'en', 'multi'],
-    order: 5,
-    reliability: 'high',
-  },
-  {
-    id: 'sf-movieboxhindi',
-    name: 'Aurora',
-    apiOrigin: 'streamforge',
-    apiSourceKey: 'movieboxhindi',
-    languageFlags: '🇮🇳🇺🇸',
-    languages: ['hi', 'en'],
-    order: 6,
-    reliability: 'high',
-  },
-
-  // === StreamForge medium-reliability (decent m3u8 when working) ===
+  // === 3. Neptune — Partially working, multi-language ===
   {
     id: 'sf-vidnest',
     name: 'Neptune',
@@ -134,71 +90,11 @@ export const SOURCES: SourceConfig[] = [
     apiSourceKey: 'vidnest',
     languageFlags: '🇫🇷🇺🇸🇰🇷',
     languages: ['fr', 'en', 'ko', 'multi'],
-    order: 7,
+    order: 3,
     reliability: 'medium',
+    note: 'Partially working — some content unavailable',
   },
-  {
-    id: 'sf-allmovieland',
-    name: 'Saturn',
-    apiOrigin: 'streamforge',
-    apiSourceKey: 'allmovieland',
-    languageFlags: '🇮🇳🇺🇸',
-    languages: ['hi', 'ta', 'te', 'en', 'multi'],
-    order: 8,
-    reliability: 'medium',
-  },
-  {
-    id: 'sf-videasy',
-    name: 'Cosmos',
-    apiOrigin: 'streamforge',
-    apiSourceKey: 'videasy',
-    languageFlags: '🇺🇸',
-    languages: ['en', 'multi'],
-    order: 9,
-    reliability: 'medium',
-  },
-
-  // === MissouriMonster high-reliability (extra API hop = slower m3u8) ===
-  {
-    id: 'mm-cinesu',
-    name: 'Orion',
-    apiOrigin: 'missourimonster',
-    apiSourceKey: 'cinesu',
-    languageFlags: '🇺🇸',
-    languages: ['en'],
-    order: 10,
-    reliability: 'high',
-  },
-  {
-    id: 'mm-meowtv',
-    name: 'Comet',
-    apiOrigin: 'missourimonster',
-    apiSourceKey: 'meowtv',
-    languageFlags: '🇺🇸',
-    languages: ['en'],
-    order: 11,
-    reliability: 'high',
-  },
-  {
-    id: 'mm-vidlink',
-    name: 'Nova',
-    apiOrigin: 'missourimonster',
-    apiSourceKey: 'vidlink',
-    languageFlags: '🇺🇸',
-    languages: ['en'],
-    order: 12,
-    reliability: 'high',
-  },
-  {
-    id: 'mm-flixhq',
-    name: 'Eclipse',
-    apiOrigin: 'missourimonster',
-    apiSourceKey: 'flixhq',
-    languageFlags: '🇺🇸',
-    languages: ['en'],
-    order: 13,
-    reliability: 'high',
-  },
+  // === 4. Titan (MM vidrock) — Working via MissouriMonster ===
   {
     id: 'mm-vidrock',
     name: 'Titan',
@@ -206,105 +102,8 @@ export const SOURCES: SourceConfig[] = [
     apiSourceKey: 'vidrock',
     languageFlags: '🇺🇸',
     languages: ['en'],
-    order: 14,
+    order: 4,
     reliability: 'high',
-  },
-
-  // === MissouriMonster medium-reliability ===
-  {
-    id: 'mm-icefy',
-    name: 'Glacier',
-    apiOrigin: 'missourimonster',
-    apiSourceKey: 'icefy',
-    languageFlags: '🇺🇸',
-    languages: ['en'],
-    order: 15,
-    reliability: 'medium',
-  },
-  {
-    id: 'mm-fsharetv',
-    name: 'Pulsar',
-    apiOrigin: 'missourimonster',
-    apiSourceKey: 'fsharetv',
-    languageFlags: '🇺🇸',
-    languages: ['en'],
-    order: 16,
-    reliability: 'medium',
-  },
-  {
-    id: 'mm-vidzee',
-    name: 'Zenith',
-    apiOrigin: 'missourimonster',
-    apiSourceKey: 'vidzee',
-    languageFlags: '🇺🇸',
-    languages: ['en'],
-    order: 17,
-    reliability: 'medium',
-  },
-  {
-    id: 'mm-vidfun',
-    name: 'Spark',
-    apiOrigin: 'missourimonster',
-    apiSourceKey: 'vidfun',
-    languageFlags: '🇺🇸',
-    languages: ['en'],
-    order: 18,
-    reliability: 'medium',
-  },
-
-  // === Low reliability / broken (last resort) ===
-  {
-    id: 'mm-cinezo',
-    name: 'Nebula',
-    apiOrigin: 'missourimonster',
-    apiSourceKey: 'cinezo',
-    languageFlags: '🇺🇸',
-    languages: ['en'],
-    order: 19,
-    reliability: 'low',
-  },
-  {
-    id: 'mm-videasy',
-    name: 'Drift',
-    apiOrigin: 'missourimonster',
-    apiSourceKey: 'videasy',
-    languageFlags: '🇺🇸',
-    languages: ['en'],
-    order: 20,
-    reliability: 'low',
-  },
-  {
-    id: 'sf-vixsrc',
-    name: 'Shadow',
-    apiOrigin: 'streamforge',
-    apiSourceKey: 'vixsrc',
-    languageFlags: '🇺🇸🇮🇹',
-    languages: ['en', 'it', 'multi'],
-    order: 21,
-    reliability: 'low',
-    note: 'Cloudflare-blocked from datacenter IPs',
-  },
-  {
-    id: 'sf-vidsrc',
-    name: 'Echo',
-    apiOrigin: 'streamforge',
-    apiSourceKey: 'vidsrc',
-    languageFlags: '🇺🇸',
-    languages: ['en'],
-    order: 22,
-    reliability: 'low',
-    note: 'Cloudflare-blocked from datacenter IPs',
-  },
-  {
-    id: 'mm-vixsrc',
-    name: 'Phantom',
-    apiOrigin: 'missourimonster',
-    apiSourceKey: 'vixsrc',
-    languageFlags: '🇺🇸',
-    languages: ['en'],
-    order: 23,
-    reliability: 'low',
-    note: 'Cloudflare-blocked from datacenter IPs',
   },
 ];
 
