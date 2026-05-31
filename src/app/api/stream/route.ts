@@ -825,6 +825,285 @@ async function fetchStreamForge(
   }
 }
 
+// ─── Direct provider: VidApi — fetches m3u8 URLs directly ────────────────────
+
+const VIDAPI_BASE = 'https://streamdata.vaplayer.ru/api.php';
+const VIDAPI_REFERER = 'https://brightpathsignals.com';
+const VIDAPI_ORIGIN = 'https://brightpathsignals.com';
+
+async function fetchDirectProvider(
+  sourceKey: string,
+  tmdbId: string,
+  type: string,
+  season?: string,
+  episode?: string
+): Promise<StreamResult> {
+  const startTime = Date.now();
+
+  let apiUrl: string;
+  if (type === 'tv' && season && episode) {
+    apiUrl = `${VIDAPI_BASE}?tmdb=${tmdbId}&type=tv&season=${season}&episode=${episode}`;
+  } else {
+    apiUrl = `${VIDAPI_BASE}?tmdb=${tmdbId}&type=movie`;
+  }
+
+  try {
+    const response = await fetch(apiUrl, {
+      headers: {
+        'Referer': VIDAPI_REFERER,
+        'Origin': VIDAPI_ORIGIN,
+        'Accept': 'application/json',
+      },
+      signal: AbortSignal.timeout(30000),
+    });
+    const data = await response.json();
+    const elapsedMs = Date.now() - startTime;
+
+    // Expected format: { status_code: "200", data: { stream_urls: [...], file_name: "..." }, default_subs: [...] }
+    if (data.status_code !== '200' || !data.data?.stream_urls?.length) {
+      return {
+        sourceId: `direct-${sourceKey}`,
+        sourceName: sourceKey,
+        success: false,
+        url: null,
+        rawUrl: null,
+        audioTracks: [],
+        qualities: [],
+        languageFlags: '',
+        elapsedMs,
+        error: data.status_code !== '200' ? `VidApi error: status ${data.status_code}` : 'No stream URLs found',
+        needsProxy: true,
+      };
+    }
+
+    const streamUrls: string[] = data.data.stream_urls;
+    const fileName: string = data.data.file_name || '';
+
+    // Verify each m3u8 URL by fetching it — VidApi CDNs are often CF-blocked
+    const vidApiHeaders: Record<string, string> = {
+      Referer: VIDAPI_REFERER,
+      Origin: VIDAPI_ORIGIN,
+    };
+
+    const verifiedUrls: Array<{ url: string; isHls: boolean; unverified?: boolean }> = [];
+
+    const verifyPromises = streamUrls.map(async (url: string) => {
+      try {
+        const isHls = url.endsWith('.m3u8') || url.includes('.m3u8?');
+        const isMp4 = url.endsWith('.mp4') || url.includes('.mp4?');
+
+        // For m3u8 URLs, try to verify by fetching
+        if (isHls) {
+          const headResp = await fetch(url, {
+            headers: vidApiHeaders,
+            signal: AbortSignal.timeout(5000),
+          });
+          if (headResp.ok) {
+            const text = await headResp.text();
+            if (text.includes('#EXTM3U')) {
+              return { url, isHls: true };
+            }
+          }
+          // m3u8 fetch failed (probably CF-blocked), still include it —
+          // it may work through the HF proxy
+          return { url, isHls: true, unverified: true };
+        }
+
+        // For mp4 URLs, just include them as-is
+        if (isMp4) {
+          return { url, isHls: false };
+        }
+
+        // Unknown format — try to fetch and check
+        const headResp = await fetch(url, {
+          headers: vidApiHeaders,
+          signal: AbortSignal.timeout(5000),
+        });
+        if (headResp.ok) {
+          const contentType = headResp.headers.get('content-type') || '';
+          const text = await headResp.text();
+          if (text.includes('#EXTM3U') || contentType.includes('mpegurl')) {
+            return { url, isHls: true };
+          }
+          return { url, isHls: false };
+        }
+        return { url, isHls: false, unverified: true };
+      } catch {
+        // Fetch failed (likely CF-blocked), still include — proxy may help
+        const isHls = url.endsWith('.m3u8') || url.includes('.m3u8?');
+        return { url, isHls, unverified: true };
+      }
+    });
+
+    const verifyResults = await Promise.allSettled(verifyPromises);
+    for (const settled of verifyResults) {
+      if (settled.status === 'fulfilled' && settled.value) {
+        verifiedUrls.push(settled.value);
+      }
+    }
+
+    if (verifiedUrls.length === 0) {
+      return {
+        sourceId: `direct-${sourceKey}`,
+        sourceName: sourceKey,
+        success: false,
+        url: null,
+        rawUrl: null,
+        audioTracks: [],
+        qualities: [],
+        languageFlags: '',
+        elapsedMs,
+        error: 'No working stream URLs found',
+        needsProxy: true,
+      };
+    }
+
+    // Pick primary: prefer verified HLS, then unverified HLS, then mp4
+    const verifiedHls = verifiedUrls.find(v => v.isHls && !('unverified' in v));
+    const anyHls = verifiedUrls.find(v => v.isHls);
+    const primaryUrl = (verifiedHls || anyHls || verifiedUrls[0]).url;
+
+    let audioTracks: AudioTrack[] = [];
+    let qualities: QualityLevel[] = [];
+    let subtitles: StreamResult['subtitles'] = [];
+
+    // Try to parse the primary m3u8 for audio tracks and qualities
+    if ((verifiedHls || anyHls)?.isHls) {
+      try {
+        const m3u8Response = await fetch(primaryUrl, {
+          headers: vidApiHeaders,
+          signal: AbortSignal.timeout(5000),
+        });
+        if (m3u8Response.ok) {
+          const m3u8Content = await m3u8Response.text();
+          if (m3u8Content.includes('#EXTM3U')) {
+            const parsed = parseM3U8(m3u8Content, primaryUrl);
+            audioTracks = parsed.audioTracks;
+            qualities = parsed.qualities;
+          }
+        }
+      } catch {
+        // m3u8 fetch failed, continue without track info
+      }
+    }
+
+    // Fallback audio track
+    if (audioTracks.length === 0) {
+      const detectedLang = detectLanguageFromUrl(primaryUrl, fileName);
+      if (detectedLang) {
+        const langCode = langNameToCode(detectedLang);
+        audioTracks = [{
+          language: langCode,
+          name: detectedLang,
+          default: true,
+          uri: null,
+          flagEmoji: getFlagForLangCode(langCode),
+        }];
+      } else {
+        audioTracks = [{ language: 'en', name: 'English', default: true, uri: null, flagEmoji: '🇺🇸' }];
+      }
+    }
+
+    // Build multiStreams from all working URLs
+    let multiStreams: Array<{
+      title: string;
+      quality: string;
+      language: string;
+      url: string;
+      type: string;
+      audioTracks: AudioTrack[];
+    }> | undefined;
+
+    if (verifiedUrls.length > 1) {
+      multiStreams = verifiedUrls.map((v, idx) => {
+        const streamUrl = v.url;
+        const detectedLang = detectLanguageFromUrl(streamUrl, fileName);
+        const languageName = detectedLang || 'English';
+        const langCode = langNameToCode(languageName);
+        const streamType = v.isHls ? 'm3u8' : 'mp4';
+
+        // Determine quality hint from URL or position
+        const qualityHint = streamUrl.match(/(\d{3,4})p/)?.[1]
+        const quality = qualityHint ? `${qualityHint}p` : 'Auto'
+
+        return {
+          title: `${fileName || 'Stream'} ${idx + 1}`,
+          quality,
+          language: languageName,
+          url: buildProxyUrl(streamUrl, vidApiHeaders),
+          type: streamType,
+          audioTracks: [{
+            language: langCode,
+            name: languageName,
+            default: langCode === 'en',
+            uri: null,
+            flagEmoji: getFlagForLangCode(langCode),
+          }],
+        };
+      });
+    }
+
+    // Parse subtitles from default_subs array
+    if (data.default_subs && Array.isArray(data.default_subs)) {
+      subtitles = data.default_subs
+        .filter((sub: any) => sub.file)
+        .map((sub: any) => {
+          const label = sub.label || 'Unknown';
+          const langCode = detectLanguageFromLabel(label);
+          // Auto-detect subtitle format from file extension
+          const fileLower = (sub.file as string).toLowerCase();
+          let subType: 'vtt' | 'srt' | 'ass' = 'vtt';
+          if (fileLower.endsWith('.srt')) subType = 'srt';
+          else if (fileLower.endsWith('.ass') || fileLower.endsWith('.ssa')) subType = 'ass';
+          else if (fileLower.endsWith('.vtt')) subType = 'vtt';
+
+          return {
+            label,
+            url: sub.file,
+            type: subType,
+            language: langCode,
+            flagEmoji: getFlagForLangCode(langCode),
+          };
+        });
+    }
+
+    // Route the primary URL through HF proxy
+    const playableUrl = buildProxyUrl(primaryUrl, vidApiHeaders);
+
+    return {
+      sourceId: `direct-${sourceKey}`,
+      sourceName: sourceKey,
+      success: true,
+      url: playableUrl,
+      rawUrl: primaryUrl,
+      audioTracks,
+      qualities,
+      languageFlags: generateFlagsFromLangs(audioTracks.map(t => t.language)),
+      headers: vidApiHeaders,
+      elapsedMs,
+      error: null,
+      needsProxy: true,
+      subtitles: subtitles && subtitles.length > 0 ? subtitles : undefined,
+      multiStreams: multiStreams && multiStreams.length > 1 ? multiStreams : undefined,
+    };
+  } catch (err) {
+    const elapsedMs = Date.now() - startTime;
+    return {
+      sourceId: `direct-${sourceKey}`,
+      sourceName: sourceKey,
+      success: false,
+      url: null,
+      rawUrl: null,
+      audioTracks: [],
+      qualities: [],
+      languageFlags: '',
+      elapsedMs,
+      error: err instanceof Error ? err.message : 'Fetch failed',
+      needsProxy: true,
+    };
+  }
+}
+
 // ─── Combined mode: Fetch all sources from both APIs ──────────────────────────
 
 async function fetchMissourimonsterCombined(type: string, tmdbId: string, season: string, episode: string, externalSignal?: AbortSignal): Promise<StreamData | null> {
@@ -939,6 +1218,89 @@ async function fetchStreamForgeCombined(type: string, tmdbId: string, season: st
   }
 }
 
+async function fetchDirectProviderCombined(type: string, tmdbId: string, season: string, episode: string, externalSignal?: AbortSignal): Promise<StreamData | null> {
+  try {
+    let apiUrl: string
+    if (type === 'tv') {
+      apiUrl = `${VIDAPI_BASE}?tmdb=${encodeURIComponent(tmdbId)}&type=tv&season=${encodeURIComponent(season)}&episode=${encodeURIComponent(episode)}`
+    } else {
+      apiUrl = `${VIDAPI_BASE}?tmdb=${encodeURIComponent(tmdbId)}&type=movie`
+    }
+
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), 12000)
+    if (externalSignal) {
+      if (externalSignal.aborted) { controller.abort() }
+      else { externalSignal.addEventListener('abort', () => controller.abort(), { once: true }) }
+    }
+
+    const response = await fetch(apiUrl, {
+      signal: controller.signal,
+      headers: {
+        'Accept': 'application/json',
+        'Referer': VIDAPI_REFERER,
+        'Origin': VIDAPI_ORIGIN,
+      },
+      cache: 'no-store',
+    })
+
+    clearTimeout(timeout)
+    if (!response.ok) return null
+
+    const data = await response.json()
+    if (data.status_code !== '200' || !data.data?.stream_urls?.length) return null
+
+    const vidApiHeaders: Record<string, string> = {
+      Referer: VIDAPI_REFERER,
+      Origin: VIDAPI_ORIGIN,
+    }
+
+    // Convert VidApi stream_urls to unified format
+    const sources: StreamSource[] = data.data.stream_urls
+      .filter((url: string) => url)
+      .map((url: string, idx: number) => {
+        const isHls = url.endsWith('.m3u8') || url.includes('.m3u8?')
+        const detectedLang = detectLanguageFromUrl(url, data.data.file_name)
+        const language = detectedLang || 'English'
+        const quality = isHls ? 'Auto' : 'Auto'
+        const playableUrl = buildProxyUrl(url, vidApiHeaders)
+
+        return {
+          source: `vidapi_${idx + 1}`,
+          label: `VidApi ${idx + 1}`,
+          url: playableUrl,
+          language,
+          quality,
+        }
+      })
+
+    // Convert subtitles from default_subs
+    const subtitles: StreamSubtitle[] = (data.default_subs || [])
+      .filter((sub: any) => sub.file)
+      .map((sub: any) => {
+        const label = sub.label || 'Unknown'
+        const langCode = detectLanguageFromLabel(label)
+        const fileLower = (sub.file as string).toLowerCase()
+        let subType = 'vtt'
+        if (fileLower.endsWith('.srt')) subType = 'srt'
+        else if (fileLower.endsWith('.ass') || fileLower.endsWith('.ssa')) subType = 'ass'
+
+        return {
+          label,
+          file: sub.file,
+          type: subType,
+          source: 'vidapi',
+          language: langCode,
+        }
+      })
+
+    return { sources, subtitles }
+  } catch (error) {
+    console.error('[Stream API] VidApi combined error:', error)
+    return null
+  }
+}
+
 function buildCachedResponse(data: any, cacheStatus: string, age: string): NextResponse {
   return NextResponse.json(data, {
     headers: {
@@ -1019,6 +1381,8 @@ async function _GET(request: NextRequest) {
 
     if (sourceConfig.apiOrigin === 'missourimonster') {
       result = await fetchMissouriMonster(sourceConfig.apiSourceKey, tmdbIdParam, type, season, episode)
+    } else if (sourceConfig.apiOrigin === 'direct') {
+      result = await fetchDirectProvider(sourceConfig.apiSourceKey, tmdbIdParam, type, season, episode)
     } else {
       result = await fetchStreamForge(sourceConfig.apiSourceKey, tmdbIdParam, type, season, episode)
     }
@@ -1109,12 +1473,13 @@ async function _GET(request: NextRequest) {
   warmUpPing(MM_BASE, 'missourimonster')
   warmUpPing(SF_BASE, 'StreamForge')
 
-  const [mmData, sfData] = await Promise.all([
+  const [mmData, sfData, vidApiData] = await Promise.all([
     fetchWithTimeout((signal) => fetchMissourimonsterCombined(type, id, season, episode, signal), 12000, 'missourimonster'),
     fetchWithTimeout((signal) => fetchStreamForgeCombined(type, id, season, episode, signal), 15000, 'StreamForge'),
+    fetchWithTimeout((signal) => fetchDirectProviderCombined(type, id, season, episode, signal), 12000, 'VidApi'),
   ])
 
-  // Merge sources — StreamForge FIRST, then missourimonster
+  // Merge sources — StreamForge FIRST, then missourimonster, then VidApi
   const mmSources: StreamSource[] = (mmData?.sources || []).map((s: StreamSource) => ({
     ...s,
     language: s.language || undefined,
@@ -1122,9 +1487,11 @@ async function _GET(request: NextRequest) {
   }))
 
   const sfSources: StreamSource[] = sfData?.sources || []
+  const vidApiSources: StreamSource[] = vidApiData?.sources || []
   const subtitles: StreamSubtitle[] = [
     ...(mmData?.subtitles || []),
     ...(sfData?.subtitles || []),
+    ...(vidApiData?.subtitles || []),
   ]
 
   // Deduplicate subtitles
@@ -1136,7 +1503,7 @@ async function _GET(request: NextRequest) {
     return true
   })
 
-  // Merge: StreamForge first, then missourimonster — deduplicate by URL
+  // Merge: StreamForge first, then missourimonster, then VidApi — deduplicate by URL
   const seenUrls = new Set<string>()
   const allSources: StreamSource[] = []
 
@@ -1156,7 +1523,15 @@ async function _GET(request: NextRequest) {
     }
   }
 
-  console.log(`[Stream API] Merged: ${sfSources.length} StreamForge + ${mmSources.length} missourimonster = ${allSources.length} total`)
+  for (const s of vidApiSources) {
+    const urlKey = s.url.toLowerCase().trim()
+    if (!seenUrls.has(urlKey)) {
+      seenUrls.add(urlKey)
+      allSources.push(s)
+    }
+  }
+
+  console.log(`[Stream API] Merged: ${sfSources.length} StreamForge + ${mmSources.length} missourimonster + ${vidApiSources.length} VidApi = ${allSources.length} total`)
 
   if (allSources.length === 0) {
     return buildNoCacheResponse(
@@ -1187,16 +1562,18 @@ function refreshCombinedInBackground(type: string, id: string, season: string, e
   ;(async () => {
     try {
       console.log(`[Stream API] Background refresh: ${cacheKey}`)
-      const [mmData, sfData] = await Promise.all([
+      const [mmData, sfData, vidApiData] = await Promise.all([
         fetchMissourimonsterCombined(type, id, season, episode),
         fetchStreamForgeCombined(type, id, season, episode),
+        fetchDirectProviderCombined(type, id, season, episode),
       ])
 
       const mmSources: StreamSource[] = (mmData?.sources || []).map((s: StreamSource) => ({
         ...s, language: s.language || undefined, quality: s.quality || undefined,
       }))
       const sfSources: StreamSource[] = sfData?.sources || []
-      const subtitles: StreamSubtitle[] = [...(mmData?.subtitles || []), ...(sfData?.subtitles || [])]
+      const vidApiSources: StreamSource[] = vidApiData?.sources || []
+      const subtitles: StreamSubtitle[] = [...(mmData?.subtitles || []), ...(sfData?.subtitles || []), ...(vidApiData?.subtitles || [])]
 
       const seenSubs = new Set<string>()
       const dedupedSubs = subtitles.filter(sub => {
@@ -1213,6 +1590,10 @@ function refreshCombinedInBackground(type: string, id: string, season: string, e
         if (!seenUrls.has(urlKey)) { seenUrls.add(urlKey); allSources.push(s) }
       }
       for (const s of mmSources) {
+        const urlKey = s.url.toLowerCase().trim()
+        if (!seenUrls.has(urlKey)) { seenUrls.add(urlKey); allSources.push(s) }
+      }
+      for (const s of vidApiSources) {
         const urlKey = s.url.toLowerCase().trim()
         if (!seenUrls.has(urlKey)) { seenUrls.add(urlKey); allSources.push(s) }
       }
@@ -1235,6 +1616,8 @@ function refreshSourceInBackground(sourceConfig: any, tmdbId: string, type: stri
       let result: StreamResult
       if (sourceConfig.apiOrigin === 'missourimonster') {
         result = await fetchMissouriMonster(sourceConfig.apiSourceKey, tmdbId, type, season, episode)
+      } else if (sourceConfig.apiOrigin === 'direct') {
+        result = await fetchDirectProvider(sourceConfig.apiSourceKey, tmdbId, type, season, episode)
       } else {
         result = await fetchStreamForge(sourceConfig.apiSourceKey, tmdbId, type, season, episode)
       }
