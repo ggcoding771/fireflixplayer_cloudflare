@@ -119,11 +119,6 @@ function EmbedModePlayer({
 
         if (!data.sources || data.sources.length === 0) {
           setError('No streams available for this content');
-          // Notify parent
-          try {
-            window.parent.postMessage({ type: 'FIREFLIX_NO_STREAMS' }, '*');
-            window.parent.postMessage({ type: 'noStreams' }, '*');
-          } catch {}
           setLoading(false);
           return;
         }
@@ -136,8 +131,8 @@ function EmbedModePlayer({
             'dooflix', 'movieboxhindi',
             'vidnest', 'allmovieland', 'videasy',
             'cinesu', 'meowtv', 'vidlink', 'flixhq', 'vidrock',
-            'icefy', 'fsharetv', 'vidzee', 'vidfun',
-            'cinezo', 'vixsrc', 'vidsrc',
+            'icefy', 'fsharetv', 
+            
           ];
           const aIdx = priorityOrder.indexOf(a.source);
           const bIdx = priorityOrder.indexOf(b.source);
@@ -259,10 +254,10 @@ function EmbedModePlayer({
     });
 
     // Try next source that hasn't failed
-    const nextSource = sortedSources.find(s => !failedSourcesRef.current.has(s.source));
+    const nextSource = sortedSourcesRef.current.find(s => !failedSourcesRef.current.has(s.source));
     if (nextSource) {
       setCurrentSource(nextSource);
-      setCurrentSourceIndex(sortedSources.indexOf(nextSource));
+      setCurrentSourceIndex(sortedSourcesRef.current.indexOf(nextSource));
       setError(null);
     } else {
       setError('All servers failed. Please try again later.');
@@ -272,7 +267,7 @@ function EmbedModePlayer({
         window.parent.postMessage({ type: 'noStreams' }, '*');
       } catch {}
     }
-  }, [currentSource?.source, sortedSources]);
+  }, [currentSource?.source]);
 
   // ─── Handle next episode ──────────────────────────────────────────────────
   const handleNextEpisode = useCallback(() => {
@@ -354,22 +349,10 @@ function EmbedModePlayer({
           )}
 
           {/* Error overlay */}
-          {error && !loading && (
+          {false && error && !loading && (
             <div className="absolute inset-0 flex items-center justify-center bg-black/80" style={{ zIndex: 5 }}>
               <div className="flex flex-col items-center gap-3">
                 <p className="text-sm text-zinc-400">{error}</p>
-                <button
-                  onClick={() => {
-                    setError(null);
-                    setLoading(true);
-                    setFailedSources(new Set());
-                    setCurrentSourceIndex(0);
-                    setCurrentSource(sortedSources[0] || null);
-                  }}
-                  className="px-4 py-2 bg-white/10 hover:bg-white/20 text-white text-sm rounded-md transition-colors"
-                >
-                  Retry
-                </button>
               </div>
             </div>
           )}

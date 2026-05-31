@@ -60,10 +60,11 @@ async function setCachedProxy(url: string, body: string, contentType: string, tt
 //
 // ROUTING STRATEGY (adapted for CF Pages where Workers' IPs are blocked):
 //
-// ALL stream URLs → HF proxy (CF Workers IPs are blocked by most streaming CDNs)
-// The only exception: subtitle URLs from subscdn.top → local proxy (CORS-only, no IP blocking)
-//
-// The local /api/proxy is only used as a fallback for non-stream content.
+// 1. freecdn*.top CDNs → HF proxy (bypasses Origin-header hotlink protection)
+// 2. Castle CDNs (rotating domains, path: /myhls_mps/) → HF proxy
+//    (CF Workers' IP range is blocked by these CDNs, so we route through HF)
+// 3. subscdn.top (subtitles) → local proxy (CORS blocked, but no Origin check)
+// 4. Other CDNs → local proxy (with HEAD test to check if direct access works)
 
 const HF_PROXY_BASE = 'https://epiccodergg-fireflix-api.hf.space';
 
