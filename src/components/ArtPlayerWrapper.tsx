@@ -740,6 +740,19 @@ export function ArtPlayerWrapper({
         }
       });
 
+      // Data arrived in the video element (readyState >= HAVE_CURRENT_DATA)
+      // — the stream is NOT stuck even if playback hasn't started yet
+      // (autoplay may be blocked waiting for user interaction).
+      const clearStallIfDataReady = () => {
+        if (stallTimeout && art.video.readyState >= 2) {
+          hasStartedPlaying = true;
+          clearTimeout(stallTimeout);
+          stallTimeout = null;
+        }
+      };
+      art.on('video:loadeddata', clearStallIfDataReady);
+      art.on('video:canplay', clearStallIfDataReady);
+
       art.on('video:playing', () => {
         hasStartedPlaying = true;
         if (stallTimeout) {
@@ -791,13 +804,19 @@ export function ArtPlayerWrapper({
         }
       });
 
-      // Stall timeout — only for initial load, not mid-playback hiccups
+      // Stall timeout — only for initial load, not mid-playback hiccups.
+      // 35s budget: first-load of large playlists through the edge proxy can be
+      // slow on a cold cache (upstream fetch + 458KB playlist). If the video
+      // already has data (readyState >= 2) or any buffered range, the stream is
+      // fine — it's just paused waiting for the user (autoplay blocked).
       stallTimeout = setTimeout(() => {
-        if (!hasStartedPlaying) {
-          console.warn('[HLS] Stream stuck after 20s, skipping...');
+        const vid = art.video;
+        const hasData = vid.readyState >= 2 || vid.buffered.length > 0;
+        if (!hasStartedPlaying && !hasData) {
+          console.warn('[HLS] Stream stuck after 35s, skipping...');
           notifyError();
         }
-      }, 20000);
+      }, 35000);
 
     } else if (isHls && art.video.canPlayType('application/vnd.apple.mpegurl')) {
       art.video.src = url;
