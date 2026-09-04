@@ -4,7 +4,7 @@ import { useSearchParams } from 'next/navigation';
 import { Suspense, useEffect, useState, useCallback, useRef } from 'react';
 import { EmbedPlayer } from '@/components/EmbedPlayer';
 import { ArtPlayerWrapper } from '@/components/ArtPlayerWrapper';
-import { ServerSelector } from './ServerSelector';
+import { ServerSelector } from '@/components/ServerSelector';
 import IntroSkipOverlay from '@/components/IntroSkipOverlay';
 
 // ─── Types for embed mode ─────────────────────────────────────────────────────
@@ -123,22 +123,20 @@ function EmbedModePlayer({
           return;
         }
 
-        // Sort sources by priority (same order as the reference)
-        const sorted = [...data.sources].sort((a, b) => {
-          // NetMirror → Castle → Atlas(vidrock) → Lyra(cinesu) → SF → MM → low
+        // Sort sources by priority — v14 source set (all StreamForge)
+        const sorted = [...data.sources].sort((a, a2) => {
+          // castle → meowtv → playbox → movix → vidrock → fsonic → netmirror → rest
           const priorityOrder = [
-            'netmirror', 'castle', 'vidrock', 'cinesu',
-            'dooflix', 'movieboxhindi',
-            'vidnest', 'allmovieland', 'videasy',
-            'cinesu', 'meowtv', 'vidlink', 'flixhq', 'vidrock',
-            'icefy', 'fsharetv', 
-            
+            'castle', 'meowtv', 'playbox', 'movix', 'vidrock', 'fsonic',
+            'netmirror', 'movies4u', 'persianstremio', 'vegamovies', 'hexa',
+            'vidfast', 'vidup', 'lookmovie', 'lmscript',
           ];
-          const aIdx = priorityOrder.indexOf(a.source);
-          const bIdx = priorityOrder.indexOf(b.source);
-          const aPrio = aIdx === -1 ? 999 : aIdx;
-          const bPrio = bIdx === -1 ? 999 : bIdx;
-          return aPrio - bPrio;
+          const idx = (s: EmbedStreamSource) => {
+            const base = (s.source || '').split('_')[0].toLowerCase();
+            const i = priorityOrder.indexOf(base);
+            return i === -1 ? 999 : i;
+          };
+          return idx(a) - idx(a2);
         });
 
         setStreamData(data);

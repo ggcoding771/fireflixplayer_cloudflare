@@ -69,8 +69,14 @@ export const LANG_FLAGS: Record<string, string> = {
 //   Fmovies4U (disabled), AnyEmbed (disabled/unstable), FshareTV (needs IMDb ID)
 // These cannot be used from CF Workers without residential proxy infrastructure.
 
+// All sources now come from StreamForge API v14 (epiccodergg-streamforge-api.hf.space).
+// v14 added 8 Vyla-SDK-ported scrapers; the dead missourimonster-vyla Space and the
+// direct VidApi provider (same backend as PlayBox) were removed.
+// NOTE: vidfast / vidup / lookmovie / lmscript exist in the API but their upstream
+// sites 403 both HF Spaces and Cloudflare Worker egress — they are NOT listed here.
+
 export const SOURCES: SourceConfig[] = [
-  // === 1. NetMirror (Moon) — Top priority, multi-language ===
+  // === 1. Moon (NetMirror) — Top priority, multi-language ===
   {
     id: 'sf-netmirror',
     name: 'Moon',
@@ -80,9 +86,9 @@ export const SOURCES: SourceConfig[] = [
     languages: ['en', 'hi', 'ta', 'te', 'es', 'fr', 'de', 'ja', 'ko', 'ar', 'ru', 'th', 'vi', 'id', 'it', 'pt', 'pl', 'tr', 'uk', 'multi'],
     order: 1,
     reliability: 'high',
+    note: 'net27.cc embed-tmdb. Some older titles genuinely missing from NetMirror (e.g. Venom 2018) — pick another server then',
   },
-  // === 2. Castle (Pluto) — Second priority, multi-language ===
-  // CONFIRMED WORKING for Venom (912649) — was wrongly removed, now restored
+  // === 2. Pluto (Castle) — multi-language ===
   {
     id: 'sf-castle',
     name: 'Pluto',
@@ -93,7 +99,41 @@ export const SOURCES: SourceConfig[] = [
     order: 2,
     reliability: 'high',
   },
-  // === 3. Atlas — Fast English ===
+  // === 3. Neptune (MeowTV) — castle-CDN family, multi-language (replaces dead vidnest) ===
+  {
+    id: 'sf-meowtv',
+    name: 'Neptune',
+    apiOrigin: 'streamforge',
+    apiSourceKey: 'meowtv',
+    languageFlags: '🇮🇳🌍',
+    languages: ['hi', 'en', 'ta', 'te', 'multi'],
+    order: 3,
+    reliability: 'high',
+    note: 'api.meowtv.ru (hindiv3) — Castle-CDN streams, movie+TV',
+  },
+  // === 4. Vega (PlayBox) — multi-quality m3u8 (was direct-vidapi, same backend API) ===
+  {
+    id: 'sf-playbox',
+    name: 'Vega',
+    apiOrigin: 'streamforge',
+    apiSourceKey: 'playbox',
+    languageFlags: '🇺🇸',
+    languages: ['en', 'multi'],
+    order: 4,
+    reliability: 'high',
+  },
+  // === 5. Orion (Movix) — 1080p+ up to 1440p multi ===
+  {
+    id: 'sf-movix',
+    name: 'Orion',
+    apiOrigin: 'streamforge',
+    apiSourceKey: 'movix',
+    languageFlags: '🇺🇸',
+    languages: ['en', 'multi'],
+    order: 5,
+    reliability: 'high',
+  },
+  // === 6. Atlas (VidRock) — multi-server movies + TV ===
   {
     id: 'sf-vidrock',
     name: 'Atlas',
@@ -101,46 +141,66 @@ export const SOURCES: SourceConfig[] = [
     apiSourceKey: 'vidrock',
     languageFlags: '🇺🇸',
     languages: ['en'],
-    order: 3,
-    reliability: 'high',
-  },
-  // === 4. Neptune — Partially working, multi-language ===
-  {
-    id: 'sf-vidnest',
-    name: 'Neptune',
-    apiOrigin: 'streamforge',
-    apiSourceKey: 'vidnest',
-    languageFlags: '🇫🇷🇺🇸🇰🇷',
-    languages: ['fr', 'en', 'ko', 'multi'],
-    order: 4,
-    reliability: 'medium',
-    note: 'Partially working — purstream works, klikxxi times out',
-  },
-  // === 5. Titan (MM vidrock) — Working via local proxy ===
-  {
-    id: 'mm-vidrock',
-    name: 'Titan',
-    apiOrigin: 'missourimonster',
-    apiSourceKey: 'vidrock',
-    languageFlags: '🇺🇸',
-    languages: ['en'],
-    order: 5,
-    reliability: 'high',
-    note: 'Slow (~12s) but reliable — raw URL through local proxy with vidrock.ru headers',
-  },
-  // === 6. VidApi (Vega) — Direct provider, multiple m3u8 URLs ===
-  // Returns multiple m3u8 URLs from CF-protected CDNs. Routed through HF proxy.
-  // CDN domains (creativeautomationlab.site, tmstrd.justhd.tv) block datacenter IPs.
-  {
-    id: 'direct-vidapi',
-    name: 'Vega',
-    apiOrigin: 'direct',
-    apiSourceKey: 'vidapi',
-    languageFlags: '🇺🇸',
-    languages: ['en'],
     order: 6,
+    reliability: 'high',
+    note: 'ngcorp.dad / flamingo workers m3u8 — movies verified; some TV servers 403',
+  },
+  // === 7. Titan (Fsonic) — direct MP4 720/1080 (replaces dead mm-vidrock) ===
+  {
+    id: 'sf-fsonic',
+    name: 'Titan',
+    apiOrigin: 'streamforge',
+    apiSourceKey: 'fsonic',
+    languageFlags: '🇺🇸',
+    languages: ['en'],
+    order: 7,
     reliability: 'medium',
-    note: 'VidApi CDNs are CF-protected — routed through HF proxy',
+    note: 'fsharetv.co direct MP4 — movies only',
+  },
+  // === 8. Comet (Movies4u) — Hindi/English acek-cdn + hubcloud ===
+  {
+    id: 'sf-movies4u',
+    name: 'Comet',
+    apiOrigin: 'streamforge',
+    apiSourceKey: 'movies4u',
+    languageFlags: '🇮🇳',
+    languages: ['hi', 'en', 'multi'],
+    order: 8,
+    reliability: 'medium',
+  },
+  // === 9. Lyra (PersianStremio) — direct MKV up to 4K ===
+  {
+    id: 'sf-persianstremio',
+    name: 'Lyra',
+    apiOrigin: 'streamforge',
+    apiSourceKey: 'persianstremio',
+    languageFlags: '🌍',
+    languages: ['multi', 'fa'],
+    order: 9,
+    reliability: 'high',
+  },
+  // === 10. Sirius (Hexa) — intermittent ===
+  {
+    id: 'sf-hexa',
+    name: 'Sirius',
+    apiOrigin: 'streamforge',
+    apiSourceKey: 'hexa',
+    languageFlags: '🇺🇸',
+    languages: ['en'],
+    order: 10,
+    reliability: 'low',
+    note: 'dragonballzfans CDNs — intermittent availability',
+  },
+  // === 11. Aries (VegaMovies) — Hindi multi-host MKV up to 4K ===
+  {
+    id: 'sf-vegamovies',
+    name: 'Aries',
+    apiOrigin: 'streamforge',
+    apiSourceKey: 'vegamovies',
+    languageFlags: '🇮🇳',
+    languages: ['hi', 'en', 'multi'],
+    order: 11,
+    reliability: 'medium',
   },
 ];
 

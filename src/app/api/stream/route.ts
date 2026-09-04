@@ -1182,15 +1182,18 @@ async function fetchMissourimonsterCombined(type: string, tmdbId: string, season
 
 async function fetchStreamForgeCombined(type: string, tmdbId: string, season: string, episode: string, externalSignal?: AbortSignal): Promise<StreamData | null> {
   try {
+    // Fast, HF-reliable subset for combined (embed) mode — the full 15-source
+    // fanout can exceed the combined timeout. HF-blocked sources are skipped.
+    const fastSources = 'castle,meowtv,playbox,movix,vidrock,fsonic'
     let url: string
     if (type === 'tv') {
-      url = `${SF_BASE}/tv/${encodeURIComponent(tmdbId)}/${encodeURIComponent(season)}/${encodeURIComponent(episode)}`
+      url = `${SF_BASE}/tv/${encodeURIComponent(tmdbId)}/${encodeURIComponent(season)}/${encodeURIComponent(episode)}?sources=${fastSources}`
     } else {
-      url = `${SF_BASE}/movie/${encodeURIComponent(tmdbId)}`
+      url = `${SF_BASE}/movie/${encodeURIComponent(tmdbId)}?sources=${fastSources}`
     }
 
     const controller = new AbortController()
-    const timeout = setTimeout(() => controller.abort(), 15000)
+    const timeout = setTimeout(() => controller.abort(), 30000)
     // Also abort if the external signal (from fetchWithTimeout) fires
     if (externalSignal) {
       if (externalSignal.aborted) { controller.abort() }
@@ -1412,17 +1415,9 @@ async function _GET(request: NextRequest) {
       }
     }
 
-    // Cache miss or nocache — fetch fresh
+    // Cache miss or nocache — fetch fresh (all sources are StreamForge v14)
     console.log(`[Stream API] Per-source ${nocache ? 'NOCACHE' : 'MISS'}: ${sourceCacheKey}`)
-    let result: StreamResult
-
-    if (sourceConfig.apiOrigin === 'missourimonster') {
-      result = await fetchMissouriMonster(sourceConfig.apiSourceKey, tmdbIdParam, type, season, episode)
-    } else if (sourceConfig.apiOrigin === 'direct') {
-      result = await fetchDirectProvider(sourceConfig.apiSourceKey, tmdbIdParam, type, season, episode)
-    } else {
-      result = await fetchStreamForge(sourceConfig.apiSourceKey, tmdbIdParam, type, season, episode)
-    }
+    const result: StreamResult = await fetchStreamForge(sourceConfig.apiSourceKey, tmdbIdParam, type, season, episode)
 
     // Cache successful results (Cache API — unlimited, free!)
     if (result.success) {
@@ -1496,9 +1491,9 @@ async function _GET(request: NextRequest) {
     }
   }
 
-  // Warm-up ping: send a quick HEAD request to both HF Spaces to wake them
+  // Warm-up ping: send a quick HEAD request to the StreamForge Space to wake it
   // from cold starts. We don't block on the result — this helps the NEXT request
-  // succeed faster.
+  // succeed faster. (missourimonster-vyla.hf.space is dead — removed.)
   const warmUpPing = (url: string, label: string) => {
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), 3000)
@@ -1507,29 +1502,12 @@ async function _GET(request: NextRequest) {
       .catch(() => { clearTimeout(timer) })
     console.log(`[Stream API] Warm-up ping sent to ${label}`)
   }
-  warmUpPing(MM_BASE, 'missourimonster')
   warmUpPing(SF_BASE, 'StreamForge')
 
-  const [mmData, sfData, vidApiData] = await Promise.all([
-    fetchWithTimeout((signal) => fetchMissourimonsterCombined(type, id, season, episode, signal), 12000, 'missourimonster'),
-    fetchWithTimeout((signal) => fetchStreamForgeCombined(type, id, season, episode, signal), 15000, 'StreamForge'),
-    fetchWithTimeout((signal) => fetchDirectProviderCombined(type, id, season, episode, signal), 12000, 'VidApi'),
-  ])
-
-  // Merge sources — StreamForge FIRST, then missourimonster, then VidApi
-  const mmSources: StreamSource[] = (mmData?.sources || []).map((s: StreamSource) => ({
-    ...s,
-    language: s.language || undefined,
-    quality: s.quality || undefined,
-  }))
+  const sfData = await fetchWithTimeout((signal) => fetchStreamForgeCombined(type, id, season, episode, signal), 35000, 'StreamForge')
 
   const sfSources: StreamSource[] = sfData?.sources || []
-  const vidApiSources: StreamSource[] = vidApiData?.sources || []
-  const subtitles: StreamSubtitle[] = [
-    ...(mmData?.subtitles || []),
-    ...(sfData?.subtitles || []),
-    ...(vidApiData?.subtitles || []),
-  ]
+  const subtitles: StreamSubtitle[] = [...(sfData?.subtitles || [])]
 
   // Deduplicate subtitles
   const seenSubs = new Set<string>()
@@ -1540,10 +1518,9 @@ async function _GET(request: NextRequest) {
     return true
   })
 
-  // Merge: StreamForge first, then missourimonster, then VidApi — deduplicate by URL
+  // Deduplicate by URL
   const seenUrls = new Set<string>()
   const allSources: StreamSource[] = []
-
   for (const s of sfSources) {
     const urlKey = s.url.toLowerCase().trim()
     if (!seenUrls.has(urlKey)) {
@@ -1552,23 +1529,7 @@ async function _GET(request: NextRequest) {
     }
   }
 
-  for (const s of mmSources) {
-    const urlKey = s.url.toLowerCase().trim()
-    if (!seenUrls.has(urlKey)) {
-      seenUrls.add(urlKey)
-      allSources.push(s)
-    }
-  }
-
-  for (const s of vidApiSources) {
-    const urlKey = s.url.toLowerCase().trim()
-    if (!seenUrls.has(urlKey)) {
-      seenUrls.add(urlKey)
-      allSources.push(s)
-    }
-  }
-
-  console.log(`[Stream API] Merged: ${sfSources.length} StreamForge + ${mmSources.length} missourimonster + ${vidApiSources.length} VidApi = ${allSources.length} total`)
+  console.log(`[Stream API] Merged: ${sfSources.length} StreamForge sources = ${allSources.length} total`)
 
   if (allSources.length === 0) {
     return buildNoCacheResponse(
@@ -1599,18 +1560,10 @@ function refreshCombinedInBackground(type: string, id: string, season: string, e
   ;(async () => {
     try {
       console.log(`[Stream API] Background refresh: ${cacheKey}`)
-      const [mmData, sfData, vidApiData] = await Promise.all([
-        fetchMissourimonsterCombined(type, id, season, episode),
-        fetchStreamForgeCombined(type, id, season, episode),
-        fetchDirectProviderCombined(type, id, season, episode),
-      ])
+      const sfData = await fetchStreamForgeCombined(type, id, season, episode)
 
-      const mmSources: StreamSource[] = (mmData?.sources || []).map((s: StreamSource) => ({
-        ...s, language: s.language || undefined, quality: s.quality || undefined,
-      }))
       const sfSources: StreamSource[] = sfData?.sources || []
-      const vidApiSources: StreamSource[] = vidApiData?.sources || []
-      const subtitles: StreamSubtitle[] = [...(mmData?.subtitles || []), ...(sfData?.subtitles || []), ...(vidApiData?.subtitles || [])]
+      const subtitles: StreamSubtitle[] = [...(sfData?.subtitles || [])]
 
       const seenSubs = new Set<string>()
       const dedupedSubs = subtitles.filter(sub => {
@@ -1623,14 +1576,6 @@ function refreshCombinedInBackground(type: string, id: string, season: string, e
       const seenUrls = new Set<string>()
       const allSources: StreamSource[] = []
       for (const s of sfSources) {
-        const urlKey = s.url.toLowerCase().trim()
-        if (!seenUrls.has(urlKey)) { seenUrls.add(urlKey); allSources.push(s) }
-      }
-      for (const s of mmSources) {
-        const urlKey = s.url.toLowerCase().trim()
-        if (!seenUrls.has(urlKey)) { seenUrls.add(urlKey); allSources.push(s) }
-      }
-      for (const s of vidApiSources) {
         const urlKey = s.url.toLowerCase().trim()
         if (!seenUrls.has(urlKey)) { seenUrls.add(urlKey); allSources.push(s) }
       }
@@ -1650,14 +1595,8 @@ function refreshSourceInBackground(sourceConfig: any, tmdbId: string, type: stri
   ;(async () => {
     try {
       console.log(`[Stream API] Background refresh per-source: ${cacheKey}`)
-      let result: StreamResult
-      if (sourceConfig.apiOrigin === 'missourimonster') {
-        result = await fetchMissouriMonster(sourceConfig.apiSourceKey, tmdbId, type, season, episode)
-      } else if (sourceConfig.apiOrigin === 'direct') {
-        result = await fetchDirectProvider(sourceConfig.apiSourceKey, tmdbId, type, season, episode)
-      } else {
-        result = await fetchStreamForge(sourceConfig.apiSourceKey, tmdbId, type, season, episode)
-      }
+      // All sources are StreamForge now (v14) — missourimonster + direct VidApi removed
+      const result: StreamResult = await fetchStreamForge(sourceConfig.apiSourceKey, tmdbId, type, season, episode)
       if (result.success) {
         // Write to Cache API (unlimited, free — no quotas to worry about!)
         await cacheApiPut(cacheKey, JSON.stringify(result))
