@@ -194,9 +194,11 @@ export async function GET(request: NextRequest) {
     if (isPlaylist) {
       const body = await response.text();
 
-      // Cache master m3u8 for 2 days (variant playlists are not cached above)
-      // Only cache if it looks like valid m3u8
-      if (body.includes('#EXTM3U') || body.includes('#EXT-X-STREAM-INF')) {
+      // Cache MASTER playlists for 2 days — detected by #EXT-X-STREAM-INF.
+      // NEVER cache media playlists (segment lists): castle-family streams are
+      // live sliding-window playlists — a 2-day-cached segment list would stall
+      // playback after the cached window. Masters are static and safe.
+      if (body.includes('#EXT-X-STREAM-INF')) {
         setCachedProxy(targetUrl, body, 'application/vnd.apple.mpegurl', M3U8_CACHE_TTL);
       }
 
@@ -314,7 +316,7 @@ function refreshProxyInBackground(
 
       if (response.ok) {
         const body = await response.text();
-        if (isM3U8 && (body.includes('#EXTM3U') || body.includes('#EXT-X'))) {
+        if (isM3U8 && body.includes('#EXT-X-STREAM-INF')) {
           await setCachedProxy(targetUrl, body, 'application/vnd.apple.mpegurl', M3U8_CACHE_TTL);
           console.log(`[Proxy] Background refresh done: ${targetUrl}`);
         }

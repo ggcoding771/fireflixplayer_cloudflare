@@ -661,7 +661,19 @@ async function fetchStreamForge(
         return lang === 'english' || urlStr.includes('_eng_') || urlStr.includes('_eng.') || detectedLang === 'English';
       });
       const primary = multiStream || englishStream || filteredResults[0];
-      const primaryUrl = primary.url;
+
+      // ── Castle-family (castle + meowtv): their m3u8 auth_keys are minted for
+      // the StreamForge Space's OWN egress IP — every other IP (CF Workers,
+      // user browsers, other HF spaces) gets 403 "Invalid auth_key". The API
+      // returns a `proxied_url` that flows through the Space's own proxy (same
+      // egress), so those sources MUST use it. Other sources (fsonic etc.) work
+      // better through the local CF proxy — VK-kcdn throws for HF egress — so
+      // they keep the raw URL.
+      const needsSpaceProxy = sourceKey === 'castle' || sourceKey === 'meowtv';
+      const effectiveUrl = (r: { url?: string; proxied_url?: string }): string =>
+        needsSpaceProxy && r.proxied_url ? r.proxied_url : (r.url || '');
+
+      const primaryUrl = effectiveUrl(primary);
 
       const headers: Record<string, string> = {};
       if (primary.headers) {
@@ -795,8 +807,8 @@ async function fetchStreamForge(
 
         // Build multiStreams from API results
         let apiMultiStreams = filteredResults.map(
-          (r: { title?: string; url?: string; language?: string; quality?: string; type?: string }) => {
-            const streamUrl = r.url || '';
+          (r: { title?: string; url?: string; proxied_url?: string; language?: string; quality?: string; type?: string }) => {
+            const streamUrl = effectiveUrl(r);
             const detectedLang = detectLanguageFromUrl(streamUrl, r.title);
             const languageName = detectedLang || r.language || 'Unknown';
             const langCode = langNameToCode(languageName);
@@ -822,7 +834,7 @@ async function fetchStreamForge(
         // Single result with multiple audio tracks: expand by m3u8 audio tracks
         if (filteredResults.length === 1 && audioTracks.length > 1) {
           const singleStream = filteredResults[0];
-          const proxyedUrl = buildProxyUrl(singleStream.url, headers);
+          const proxyedUrl = buildProxyUrl(effectiveUrl(singleStream), headers);
           apiMultiStreams = audioTracks.map((track, idx) => ({
             title: track.name,
             quality: singleStream.quality || 'Auto',
@@ -1337,9 +1349,14 @@ async function fetchStreamForgeCombined(type: string, tmdbId: string, season: st
       // Build proxy URL for StreamForge sources
       // ALL sources use local /api/proxy — it auto-routes freecdn*.top through HF
       // imgcdn.kim (fast) stays local, freecdn*.top goes through HF
+      // Castle-family sources (castle/meowtv): use the API's proxied_url — their
+      // auth_keys are minted for the StreamForge Space's egress IP, so the raw
+      // URL 403s from CF Workers ("Invalid auth_key").
       const headers: Record<string, string> = {}
       if (r.headers) Object.assign(headers, r.headers)
-      const playableUrl = buildProxyUrl(r.url, headers)
+      const isCastleFamily = sourceBase === 'castle' || sourceBase === 'meowtv'
+      const rawUrl = isCastleFamily && r.proxied_url ? r.proxied_url : r.url
+      const playableUrl = buildProxyUrl(rawUrl, headers)
 
       return {
         source: sourceId,
