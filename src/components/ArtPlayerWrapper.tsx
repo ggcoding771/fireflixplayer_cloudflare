@@ -19,6 +19,9 @@ interface ArtPlayerWrapperProps {
   headers?: Record<string, string>;
   qualities: QualityLevel[];
   audioTracks: AudioTrack[];
+  /** How to play `url`: 'hls' → hls.js manifest; 'native' → direct <video> file
+   *  (MP4/MKV). 'auto' (default) = legacy heuristic (m3u8//api/proxy → hls). */
+  playbackType?: 'auto' | 'hls' | 'native';
   desiredAudioLanguage?: string;
   onAudioTrackChange?: (track: AudioTrack) => void;
   onHlsError?: () => void;
@@ -125,6 +128,7 @@ export function ArtPlayerWrapper({
   headers: _headers,
   qualities: _qualities,
   audioTracks: _audioTracks,
+  playbackType = 'auto',
   desiredAudioLanguage,
   onAudioTrackChange,
   onHlsError,
@@ -138,6 +142,7 @@ export function ArtPlayerWrapper({
   const artInstanceRef = useRef<Artplayer | null>(null);
   const hlsRef = useRef<Hls | null>(null);
   const prevUrlRef = useRef<string | null>(null);
+  const prevPlaybackTypeRef = useRef<'auto' | 'hls' | 'native'>('auto');
   const errorNotifiedRef = useRef(false);
   const manifestParsedRef = useRef(false);
 
@@ -422,7 +427,12 @@ export function ArtPlayerWrapper({
 
     if (!url) return;
 
-    const isHls = url.includes('.m3u8') || url.includes('/api/proxy');
+    // Playback mode: the backend tells us how to play the stream. Direct
+    // files (MP4/MKV from Titan/Lyra/Aries) MUST go through the native
+    // <video> element — hls.js can never start on a raw file (it spins
+    // forever retrying a manifest that will never parse).
+    const forceNative = playbackType === 'native';
+    const isHls = !forceNative && (url.includes('.m3u8') || url.includes('/api/proxy') || playbackType === 'hls');
 
     if (isHls && Hls.isSupported()) {
       const hls = new Hls({
@@ -839,9 +849,82 @@ export function ArtPlayerWrapper({
     } else if (isHls && art.video.canPlayType('application/vnd.apple.mpegurl')) {
       art.video.src = url;
     } else if (!isHls) {
+      // ── Direct file (MP4/MKV) — native <video> playback via the proxy ──
+      // The proxy forwards Range and returns 206/Content-Range, so seeking
+      // and progressive streaming work like a normal file server.
       art.url = url;
+
+      let nativeStallTimeout: ReturnType<typeof setTimeout> | null = null;
+      let nativeStarted = false;
+
+      const clearNativeStall = () => {
+        nativeStarted = true;
+        if (nativeStallTimeout) {
+          clearTimeout(nativeStallTimeout);
+          nativeStallTimeout = null;
+        }
+      };
+      art.on('video:loadeddata', clearNativeStall);
+      art.on('video:canplay', clearNativeStall);
+      art.on('video:playing', clearNativeStall);
+
+      // Safety net: if a "direct" URL is actually an HLS playlist (mislabeled
+      // upstream), the <video> element errors before any data arrives — retry
+      // once with hls.js before declaring the source dead.
+      let hlsFallbackTried = false;
+      const tryHlsFallback = () => {
+        if (hlsFallbackTried || isStale()) return;
+        hlsFallbackTried = true;
+        if (!Hls.isSupported()) {
+          notifyError();
+          return;
+        }
+        console.log('[Player] Direct file failed before data — retrying as HLS...');
+        const fhls = new Hls({
+          maxBufferLength: 30,
+          maxMaxBufferLength: 60,
+          startLevel: -1,
+          enableWorker: true,
+          lowLatencyMode: false,
+        });
+        hlsRef.current = fhls;
+        fhls.loadSource(url);
+        fhls.attachMedia(art.video);
+        fhls.on(Hls.Events.MANIFEST_PARSED, () => {
+          if (isStale()) return;
+          art.video.play().catch(() => { /* autoplay blocked */ });
+        });
+        fhls.on(Hls.Events.ERROR, (_e, d) => {
+          if (!d.fatal || isStale()) return;
+          notifyError();
+        });
+      };
+
+      art.on('video:error', () => {
+        if (isStale()) return;
+        const vid = art.video;
+        const hasData = vid.readyState >= 2 || vid.buffered.length > 0;
+        if (!hasData && !hlsFallbackTried) {
+          tryHlsFallback();
+        } else {
+          notifyError();
+        }
+      });
+
+      // Stall timeout — same 35s budget as the HLS path: if the file never
+      // delivers any data (dead CDN, hanging connection), blame this source
+      // instead of spinning forever.
+      nativeStallTimeout = setTimeout(() => {
+        if (isStale()) return;
+        const vid = art.video;
+        const hasData = vid.readyState >= 2 || vid.buffered.length > 0;
+        if (!nativeStarted && !hasData) {
+          console.warn('[Player] Direct file stuck after 35s, skipping...');
+          notifyError();
+        }
+      }, 35000);
     }
-  }, [url, desiredAudioLanguage, applyDesiredAudioLanguage]);
+  }, [url, playbackType, desiredAudioLanguage, applyDesiredAudioLanguage]);
 
   function notifyError() {
     if (errorNotifiedRef.current) return;
@@ -850,11 +933,12 @@ export function ArtPlayerWrapper({
   }
 
   useEffect(() => {
-    if (url !== prevUrlRef.current) {
+    if (url !== prevUrlRef.current || playbackType !== prevPlaybackTypeRef.current) {
       prevUrlRef.current = url;
+      prevPlaybackTypeRef.current = playbackType;
       initPlayer();
     }
-  }, [url, initPlayer]);
+  }, [url, playbackType, initPlayer]);
 
   // ─── Listen for parent postMessage commands ─────────────────────────────
   useEffect(() => {

@@ -33,6 +33,8 @@ export interface SourceStatus {
   sourceId: string;
   status: 'pending' | 'loading' | 'success' | 'failed';
   streamUrl?: string | null;
+  /** How the player should play streamUrl: 'm3u8' → hls.js, 'direct' → native <video> */
+  streamType?: 'm3u8' | 'direct';
   audioTracks: AudioTrack[];
   qualities: QualityLevel[];
   subtitles: SubtitleTrack[];
@@ -55,6 +57,7 @@ export function EmbedPlayer({ tmdbId, type, season, episode }: EmbedPlayerProps)
   const [sourceStatuses, setSourceStatuses] = useState<Record<string, SourceStatus>>({});
   const [activeSourceId, setActiveSourceId] = useState<string | null>(null);
   const [activeStreamUrl, setActiveStreamUrl] = useState<string | null>(null);
+  const [activePlaybackType, setActivePlaybackType] = useState<'auto' | 'hls' | 'native'>('auto');
   const [activeHeaders, setActiveHeaders] = useState<Record<string, string> | undefined>();
   const [desiredAudioLanguage, setDesiredAudioLanguage] = useState<string | undefined>();
   const [loading, setLoading] = useState(true);
@@ -110,6 +113,7 @@ export function EmbedPlayer({ tmdbId, type, season, episode }: EmbedPlayerProps)
         sourceId,
         status: data.success ? 'success' : 'failed',
         streamUrl: data.url,
+        streamType: data.type === 'direct' ? 'direct' : 'm3u8',
         audioTracks: data.audioTracks || [],
         qualities: data.qualities || [],
         subtitles: data.subtitles || [],
@@ -141,6 +145,7 @@ export function EmbedPlayer({ tmdbId, type, season, episode }: EmbedPlayerProps)
 
     setActiveSourceId(sourceId);
     setActiveStreamUrl(url);
+    setActivePlaybackType(status?.streamType === 'direct' ? 'native' : 'auto');
     setActiveHeaders(status?.headers);
     setDesiredAudioLanguage(undefined);
     setLoading(false);
@@ -291,11 +296,12 @@ export function EmbedPlayer({ tmdbId, type, season, episode }: EmbedPlayerProps)
     // the user picked this one, let them pick the next move.
   }, [fetchSource, playSource]);
 
-  const handleSelectSubStream = useCallback((sourceId: string, streamUrl: string, _streamTitle: string, desiredLanguage?: string) => {
+  const handleSelectSubStream = useCallback((sourceId: string, streamUrl: string, _streamTitle: string, desiredLanguage?: string, streamType?: string) => {
     autoPlayAbortedRef.current = true;
 
     setActiveSourceId(sourceId);
     setActiveStreamUrl(streamUrl);
+    setActivePlaybackType(streamType === 'direct' ? 'native' : 'auto');
     setDesiredAudioLanguage(desiredLanguage);
     setAutoOpenSourceId(null);
     setLoading(false);
@@ -358,6 +364,7 @@ export function EmbedPlayer({ tmdbId, type, season, episode }: EmbedPlayerProps)
       <div className="absolute inset-0" style={{ zIndex: 1 }}>
         <ArtPlayerWrapper
           url={activeStreamUrl}
+          playbackType={activePlaybackType}
           headers={activeHeaders}
           qualities={[]}
           audioTracks={[]}

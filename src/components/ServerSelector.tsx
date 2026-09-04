@@ -10,7 +10,7 @@ interface ServerSelectorProps {
   sourceStatuses: Record<string, SourceStatus>;
   activeSourceId: string | null;
   onSelectSource: (sourceId: string, streamUrl?: string) => void;
-  onSelectSubStream?: (sourceId: string, streamUrl: string, streamTitle: string, desiredLanguage?: string) => void;
+  onSelectSubStream?: (sourceId: string, streamUrl: string, streamTitle: string, desiredLanguage?: string, streamType?: string) => void;
   fetchSource: (sourceId: string) => Promise<SourceStatus>;
   autoOpenSourceId?: string | null;
   onAutoOpenHandled?: () => void;
@@ -118,8 +118,8 @@ export function ServerSelector({
     }
   };
 
-  const handleSubStreamClick = (sourceId: string, streamUrl: string, streamTitle: string, desiredLanguage?: string) => {
-    onSelectSubStream?.(sourceId, streamUrl, streamTitle, desiredLanguage);
+  const handleSubStreamClick = (sourceId: string, streamUrl: string, streamTitle: string, desiredLanguage?: string, streamType?: string) => {
+    onSelectSubStream?.(sourceId, streamUrl, streamTitle, desiredLanguage, streamType);
     setIsOpen(false);
     setSelectedSourceForTracks(null);
   };
@@ -276,7 +276,8 @@ export function ServerSelector({
                             stream.url,
                             stream.title,
                             // Pass the language code from the stream's audio track for language-based matching
-                            stream.audioTracks[0]?.language || undefined
+                            stream.audioTracks[0]?.language || undefined,
+                            stream.type
                           )}
                           className="w-full flex items-center justify-between gap-1.5 px-2 py-1.5 rounded
                             text-xs text-zinc-300 hover:bg-white/10 transition-all duration-100"

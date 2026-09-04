@@ -119,6 +119,8 @@ interface StreamSource {
   url: string
   language?: string
   quality?: string
+  /** 'm3u8' (hls.js) or 'direct' (native <video>) */
+  type?: string
 }
 
 interface StreamSubtitle {
@@ -140,6 +142,8 @@ interface StreamResult {
   success: boolean;
   url: string | null;
   rawUrl: string | null;
+  /** 'm3u8' → play via hls.js; 'direct' → play via native <video> (MP4/MKV). Default 'm3u8'. */
+  type?: 'm3u8' | 'direct';
   audioTracks: AudioTrack[];
   qualities: QualityLevel[];
   languageFlags: string;
@@ -160,6 +164,7 @@ interface StreamResult {
     language: string;
     url: string;
     type: string;
+    audioTrackIndex?: number;
     audioTracks: AudioTrack[];
   }>;
 }
@@ -232,6 +237,9 @@ function buildProxyUrl(directUrl: string, headers?: Record<string, string>): str
       params.set('origin', origin);
     } catch { /* ignore */ }
   }
+  // Forward the upstream's required User-Agent (fsharetv and similar CDNs
+  // check it; the local proxy sends it with every segment/range request).
+  if (headers?.['User-Agent']) params.set('ua', headers['User-Agent']);
   return `/api/proxy?${params.toString()}`;
 }
 
@@ -517,12 +525,61 @@ async function fetchMissouriMonster(
   }
 }
 
+// ─── Direct-file liveness probe ─────────────────────────────────────────────
+// Some sources return multiple direct file URLs (fsonic: 1080/720/720) and
+// individual files die upstream with plain 4xx/5xx (e.g. "error code: 1101").
+// A 2-byte Range probe tells us which file is actually alive so the player
+// starts on a working one instead of spinning forever on a dead URL.
+// IMPORTANT: only probe plain file URLs — NEVER HF /proxy_range-wrapped URLs
+// (their tokens are single-consumer; a probe burns the token).
+async function probeDirectFile(
+  url: string,
+  headers?: Record<string, string>
+): Promise<boolean> {
+  try {
+    const probeHeaders: Record<string, string> = {
+      'User-Agent': headers?.['User-Agent'] || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+      'Range': 'bytes=0-1',
+      'Accept': '*/*',
+    };
+    if (headers?.Referer) probeHeaders['Referer'] = headers.Referer;
+    if (headers?.Origin) probeHeaders['Origin'] = headers.Origin;
+
+    const res = await fetch(url, {
+      headers: probeHeaders,
+      signal: AbortSignal.timeout(8000),
+    });
+    if (res.status !== 200 && res.status !== 206) return false;
+    const ctype = (res.headers.get('content-type') || '').toLowerCase();
+    if (ctype.includes('text/html') || ctype.includes('application/json')) return false;
+    // consume the 2 bytes so the connection is released
+    await res.arrayBuffer();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Probe candidates in order, return the first URL that responds with a
+// live media file. Caps at 4 candidates × 8s to stay inside the route budget.
+async function probeFirstLive(
+  candidates: Array<{ url: string; headers?: Record<string, string> }>
+): Promise<string | null> {
+  for (const c of candidates.slice(0, 4)) {
+    if (await probeDirectFile(c.url, c.headers)) {
+      return c.url;
+    }
+  }
+  return null;
+}
+
 async function fetchStreamForge(
   sourceKey: string,
   tmdbId: string,
   type: string,
   season?: string,
-  episode?: string
+  episode?: string,
+  selfOrigin?: string
 ): Promise<StreamResult> {
   const startTime = Date.now();
   let url: string;
@@ -565,6 +622,28 @@ async function fetchStreamForge(
         );
         if (multiOnly.length > 0) {
           filteredResults = multiOnly;
+        }
+      }
+
+      // ── Direct-file candidates: probe the first few and promote the first
+      // LIVE one to primary (fsonic's first result is often a dead file).
+      // proxy_range-wrapped URLs are skipped — probing burns their token.
+      const directCandidates = filteredResults.filter(
+        (r: { type?: string; url?: string }) =>
+          (r.type === 'direct' || r.type === 'mp4') &&
+          !(r.url || '').includes('/proxy_range')
+      );
+      if (directCandidates.length > 1) {
+        const liveUrl = await probeFirstLive(
+          directCandidates.map((r: { url: string; headers?: Record<string, string> }) => ({ url: r.url, headers: r.headers }))
+        );
+        if (liveUrl) {
+          // Move the live result to the front so it becomes `primary`
+          const idx = filteredResults.findIndex((r: { url?: string }) => r.url === liveUrl);
+          if (idx > 0) {
+            const [winner] = filteredResults.splice(idx, 1);
+            filteredResults.unshift(winner);
+          }
         }
       }
 
@@ -676,25 +755,42 @@ async function fetchStreamForge(
         }
       } else {
         // ── Non-NetMirror: Parse only primary m3u8 ──
-        try {
-          const fetchHeaders: Record<string, string> = {};
-          if (headers.Referer) fetchHeaders['Referer'] = headers.Referer;
-          if (headers['User-Agent']) fetchHeaders['User-Agent'] = headers['User-Agent'];
+        // Parse THROUGH the local /api/proxy (same URL the player will load).
+        // Two wins: ① the response lands in the edge Cache API, so the player's
+        // subsequent load is a cache HIT instead of a second upstream hit —
+        // critical for token-burning/burst-limited CDNs (m4uplay/acek-cdn),
+        // where a 2nd rapid fetch returns an error page and the video never
+        // starts even though the languages were parsed fine; ② the parse
+        // validates the exact playback chain end-to-end.
+        // NEVER do this for direct files — .text() on a 2GB MKV/MP4 would try
+        // to buffer the whole movie.
+        const isDirectPrimary = primary.type === 'direct' || primary.type === 'mp4';
+        if (!isDirectPrimary) {
+          try {
+            const parseUrl = selfOrigin
+              ? `${selfOrigin}${buildProxyUrl(primaryUrl, headers)}`
+              : primaryUrl;
 
-          const m3u8Response = await fetch(primaryUrl, {
-            headers: Object.keys(fetchHeaders).length > 0 ? fetchHeaders : undefined,
-            signal: AbortSignal.timeout(10000),
-          });
-          if (m3u8Response.ok) {
-            const m3u8Content = await m3u8Response.text();
-            if (m3u8Content.includes('#EXTM3U')) {
-              const parsed = parseM3U8(m3u8Content, primaryUrl);
-              audioTracks = parsed.audioTracks;
-              qualities = parsed.qualities;
+            const m3u8Response = parseUrl === primaryUrl
+              ? await fetch(primaryUrl, {
+                  headers: headers.Referer ? { 'Referer': headers.Referer } : undefined,
+                  signal: AbortSignal.timeout(10000),
+                })
+              : await fetch(parseUrl, {
+                  headers: { 'Accept': '*/*' },
+                  signal: AbortSignal.timeout(15000),
+                });
+            if (m3u8Response.ok) {
+              const m3u8Content = await m3u8Response.text();
+              if (m3u8Content.includes('#EXTM3U')) {
+                const parsed = parseM3U8(m3u8Content, primaryUrl);
+                audioTracks = parsed.audioTracks;
+                qualities = parsed.qualities;
+              }
             }
+          } catch {
+            // m3u8 fetch failed, continue without track info
           }
-        } catch {
-          // m3u8 fetch failed, continue without track info
         }
 
         // Build multiStreams from API results
@@ -820,6 +916,10 @@ async function fetchStreamForge(
         success: true,
         url: playableUrl,
         rawUrl: primaryUrl,
+        // Tell the player how to play it: HLS manifests via hls.js, direct
+        // files (MP4/MKV from fsonic/persianstremio/vegamovies/hexa) via the
+        // native <video> element — hls.js can never start on a raw file.
+        type: (primary.type === 'direct' || primary.type === 'mp4') ? 'direct' : 'm3u8',
         audioTracks,
         qualities,
         languageFlags: generateFlagsFromLangs(audioTracks.map(t => t.language)),
@@ -1216,7 +1316,9 @@ async function fetchStreamForgeCombined(type: string, tmdbId: string, season: st
 
     // Convert StreamForge format to unified format
     const sources: StreamSource[] = data.results.map((r: any) => {
-      if (r.type && r.type !== 'm3u8') return null
+      // Direct files (fsonic MP4, etc.) are now INCLUDED — the client plays
+      // them natively via <video> (type: 'direct'). Only skip unknown types.
+      if (r.type && r.type !== 'm3u8' && r.type !== 'direct' && r.type !== 'mp4') return null
 
       const sourceBase = r.source?.split('/')[0].toLowerCase() || 'unknown'
       const sourceSub = r.source?.split('/')[1]?.toLowerCase() || ''
@@ -1245,6 +1347,7 @@ async function fetchStreamForgeCombined(type: string, tmdbId: string, season: st
         url: playableUrl,
         language,
         quality,
+        type: (r.type === 'direct' || r.type === 'mp4') ? 'direct' : 'm3u8',
       }
     }).filter((s: any) => s !== null)
 
@@ -1417,7 +1520,10 @@ async function _GET(request: NextRequest) {
 
     // Cache miss or nocache — fetch fresh (all sources are StreamForge v14)
     console.log(`[Stream API] Per-source ${nocache ? 'NOCACHE' : 'MISS'}: ${sourceCacheKey}`)
-    const result: StreamResult = await fetchStreamForge(sourceConfig.apiSourceKey, tmdbIdParam, type, season, episode)
+    const result: StreamResult = await fetchStreamForge(
+      sourceConfig.apiSourceKey, tmdbIdParam, type, season, episode,
+      request.nextUrl.origin
+    )
 
     // Cache successful results (Cache API — unlimited, free!)
     if (result.success) {

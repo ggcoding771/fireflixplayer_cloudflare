@@ -15,6 +15,8 @@ interface EmbedStreamSource {
   url: string
   language?: string
   quality?: string
+  /** 'm3u8' (hls.js) or 'direct' (native <video>) */
+  type?: string
 }
 
 interface EmbedStreamData {
@@ -299,6 +301,7 @@ function EmbedModePlayer({
           <div className="absolute inset-0" style={{ zIndex: 1 }}>
             <ArtPlayerWrapper
               url={currentSource?.url || null}
+              playbackType={currentSource?.type === 'direct' ? 'native' : 'auto'}
               qualities={[]}
               audioTracks={[]}
               onHlsError={handleHlsError}

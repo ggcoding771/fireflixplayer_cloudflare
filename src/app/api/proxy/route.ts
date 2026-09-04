@@ -138,10 +138,12 @@ export async function GET(request: NextRequest) {
     // ─── Check Cache API for m3u8 and segment requests ────────────────
     // Master m3u8 and .ts segments can be safely cached.
     // Variant playlists (.m3u8 with #EXTINF) change too often — don't cache.
-    const isMasterM3U8 = isM3U8Content(targetUrl, '');
+    // HF /proxy_range-wrapped URLs are master playlists (StreamForge wraps
+    // masters; variants/segments inside get rewritten to absolute URLs).
+    const isMasterM3U8 = isM3U8Content(targetUrl, '') || targetUrl.includes('/proxy_range');
     const isSegment = targetUrl.includes('.ts') || targetUrl.includes('.m4s');
 
-    if (isMasterM3U8 || isSegment) {
+    if ((isMasterM3U8 || isSegment) && !request.headers.get('range')) {
       const cached = await getCachedProxy(targetUrl);
       if (cached) {
         const maxAge = isMasterM3U8 ? M3U8_CACHE_TTL : SEGMENT_CACHE_TTL;
@@ -158,12 +160,18 @@ export async function GET(request: NextRequest) {
     }
 
     const headers: Record<string, string> = {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36',
+      'User-Agent': searchParams.get('ua') || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36',
       'Accept': '*/*',
       'Accept-Language': 'en-US,en;q=0.9',
     };
     if (referer) headers['Referer'] = referer;
     if (origin) headers['Origin'] = origin;
+
+    // Forward the client's Range header so direct-file playback (MP4/MKV via
+    // <video>) can seek and stream progressively instead of downloading the
+    // whole file. The upstream's 206/Content-Range is passed back faithfully.
+    const clientRange = request.headers.get('range');
+    if (clientRange) headers['Range'] = clientRange;
 
     const response = await fetch(targetUrl, {
       headers,
@@ -171,10 +179,13 @@ export async function GET(request: NextRequest) {
     });
 
     if (!response.ok) {
-      return NextResponse.json(
-        { error: `Upstream returned ${response.status}` },
-        { status: response.status }
-      );
+      // Pass upstream errors through faithfully — hls.js and the <video>
+      // element both react correctly to real status codes (4xx/5xx), which
+      // lets the per-source error UI blame the right server.
+      return new NextResponse(null, {
+        status: response.status,
+        headers: { 'Access-Control-Allow-Origin': '*' },
+      });
     }
 
     const contentType = response.headers.get('content-type') || '';
@@ -216,7 +227,15 @@ export async function GET(request: NextRequest) {
       let responseContentType = contentType || 'application/octet-stream';
       if (targetUrl.includes('.ts') || targetUrl.includes('.m4s') || targetUrl.includes('.jpg')) {
         responseContentType = 'video/mp2t';
+      } else if (targetUrl.includes('.mkv')) {
+        // MKV — Chrome/Edge/Firefox play video/x-matroska natively
+        responseContentType = 'video/x-matroska';
       } else if (targetUrl.includes('.mp4') && !targetUrl.includes('.m3u8')) {
+        responseContentType = 'video/mp4';
+      } else if (contentType.includes('octet-stream') && (targetUrl.includes('/media/') || response.headers.get('accept-ranges'))) {
+        // Signed direct-file CDNs (fsharetv/vqcdn family) serve generic
+        // octet-stream for MP4s — give the browser a video type so it commits
+        // to playback instead of treating it as a download.
         responseContentType = 'video/mp4';
       }
 
@@ -235,17 +254,31 @@ export async function GET(request: NextRequest) {
         'X-Cache': 'MISS',
       };
       if (contentLength) responseHeaders['Content-Length'] = contentLength;
+      // Range support: pass through 206 + Content-Range/Accept-Ranges so the
+      // <video> element can seek in direct-file streams (MP4/MKV).
+      if (response.status === 206) {
+        if (response.headers.get('content-range')) {
+          responseHeaders['Content-Range'] = response.headers.get('content-range') as string;
+        }
+        responseHeaders['Accept-Ranges'] = 'bytes';
+      } else if (response.headers.get('accept-ranges')) {
+        responseHeaders['Accept-Ranges'] = response.headers.get('accept-ranges') as string;
+      }
+
+      // Preserve 206 (Partial Content) — the <video> element requires the
+      // real status + Content-Range to seek correctly in direct-file streams.
+      const outStatus = response.status === 206 ? 206 : 200;
 
       if (response.body) {
         return new NextResponse(response.body, {
-          status: 200,
+          status: outStatus,
           headers: responseHeaders,
         });
       }
 
       const arrayBuffer = await response.arrayBuffer();
       return new NextResponse(arrayBuffer, {
-        status: 200,
+        status: outStatus,
         headers: responseHeaders,
       });
     }
@@ -338,6 +371,7 @@ async function rewriteM3U8(content: string, baseUrl: string, searchParams: URLSe
   const lines = content.split('\n');
   const referer = searchParams.get('referer') || '';
   const origin = searchParams.get('origin') || '';
+  const ua = searchParams.get('ua') || '';
   const localProxyBase = '/api/proxy';
 
   // Detect Castle/freecdn/VidApi URLs
@@ -381,7 +415,7 @@ async function rewriteM3U8(content: string, baseUrl: string, searchParams: URLSe
             return `URI="${buildHFProxyUrl(resolved, referer, origin)}"`;
           }
 
-          return `URI="${buildLocalProxyUrl(localProxyBase, resolved, referer, origin)}"`;
+          return `URI="${buildLocalProxyUrl(localProxyBase, resolved, referer, origin, ua)}"`;
         });
       }
       return line;
@@ -396,23 +430,24 @@ async function rewriteM3U8(content: string, baseUrl: string, searchParams: URLSe
 
     // Sub-playlists → local proxy
     if (isM3U8Url(resolved)) {
-      return buildLocalProxyUrl(localProxyBase, resolved, referer, origin);
+      return buildLocalProxyUrl(localProxyBase, resolved, referer, origin, ua);
     }
 
     // Subtitle segments → local proxy
     if (isSubtitleSegment(resolved)) {
-      return buildLocalProxyUrl(localProxyBase, resolved, referer, origin);
+      return buildLocalProxyUrl(localProxyBase, resolved, referer, origin, ua);
     }
 
     // Other segments → local proxy
-    return buildLocalProxyUrl(localProxyBase, resolved, referer, origin);
+    return buildLocalProxyUrl(localProxyBase, resolved, referer, origin, ua);
   }).join('\n');
 }
 
-function buildLocalProxyUrl(proxyBase: string, resolvedUrl: string, referer: string, origin: string): string {
+function buildLocalProxyUrl(proxyBase: string, resolvedUrl: string, referer: string, origin: string, ua?: string): string {
   let url = `${proxyBase}?url=${encodeURIComponent(resolvedUrl)}`;
   if (referer) url += `&referer=${encodeURIComponent(referer)}`;
   if (origin) url += `&origin=${encodeURIComponent(origin)}`;
+  if (ua) url += `&ua=${encodeURIComponent(ua)}`;
   return url;
 }
 
