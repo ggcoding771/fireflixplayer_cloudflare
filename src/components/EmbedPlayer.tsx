@@ -398,7 +398,12 @@ export function EmbedPlayer({ tmdbId, type, season, episode }: EmbedPlayerProps)
         const allSourcesFailed = hasSources
           && sources.every(s => sourceStatuses[s.id]?.status === 'failed');
 
-        if (activeStreamUrl || loading) {
+        if (activeStreamUrl) {
+          // Playing — no overlay at all.
+          return null;
+        }
+
+        if (loading) {
           return (
             <div
               className="absolute inset-0 flex items-center justify-center bg-black/80"
