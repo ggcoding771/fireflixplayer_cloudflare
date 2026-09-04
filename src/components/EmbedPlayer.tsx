@@ -60,6 +60,9 @@ export function EmbedPlayer({ tmdbId, type, season, episode }: EmbedPlayerProps)
   const [loading, setLoading] = useState(true);
   // When set, the ServerSelector auto-opens to show multiStreams for this source
   const [autoOpenSourceId, setAutoOpenSourceId] = useState<string | null>(null);
+  // Bumped by the "Retry" button for a FULL fresh restart (only offered when
+  // every server has failed). The init effect depends on it.
+  const [reloadKey, setReloadKey] = useState(0);
 
   const autoPlayAbortedRef = useRef(false);
   const autoPlayIndexRef = useRef(0);
@@ -148,21 +151,31 @@ export function EmbedPlayer({ tmdbId, type, season, episode }: EmbedPlayerProps)
 
     for (let i = startIndex; i < sourceList.length; i++) {
       if (autoPlayAbortedRef.current) {
-        pendingAutoPlayRef.current = i;
         return;
       }
 
       autoPlayIndexRef.current = i;
       const source = sourceList[i];
 
-      const status = await fetchSource(source.id);
+      // Use what we already know — never re-fetch sources with a known
+      // status. A source that failed for this title will fail again, so
+      // skipping it instantly avoids the "reset to server #1 and re-fetch
+      // everything" storm when the chain restarts.
+      const cached = sourceStatusesRef.current[source.id];
+      let status: SourceStatus | null = null;
+      if (cached?.status === 'success' && cached.streamUrl) {
+        status = cached;
+      } else if (cached?.status === 'failed') {
+        continue; // known-failed — skip without a network round-trip
+      } else {
+        status = await fetchSource(source.id);
+      }
 
       if (autoPlayAbortedRef.current) {
-        pendingAutoPlayRef.current = i;
         return;
       }
 
-      if (status.status === 'success' && status.streamUrl) {
+      if (status && status.status === 'success' && status.streamUrl) {
         playSource(source.id, status.streamUrl);
 
         // If this source has multiStreams, auto-open the dropdown so user can pick a language
@@ -219,7 +232,7 @@ export function EmbedPlayer({ tmdbId, type, season, episode }: EmbedPlayerProps)
       controller.abort();
       autoPlayAbortedRef.current = true;
     };
-  }, [tmdbId, type, season, episode, tryAutoPlay]);
+  }, [tmdbId, type, season, episode, tryAutoPlay, reloadKey]);
 
   const handleHlsError = useCallback(() => {
     const currentSourceId = activeSourceId;
@@ -271,12 +284,12 @@ export function EmbedPlayer({ tmdbId, type, season, episode }: EmbedPlayerProps)
 
     if (status.status === 'success' && status.streamUrl) {
       playSource(sourceId, status.streamUrl);
-    } else {
-      const resumeIndex = pendingAutoPlayRef.current ?? autoPlayIndexRef.current + 1;
-      autoPlayAbortedRef.current = false;
-      tryAutoPlay(sourcesRef.current, resumeIndex);
     }
-  }, [fetchSource, playSource, tryAutoPlay]);
+    // If the user's chosen server failed: fetchSource already marked it
+    // failed and the per-source error card appears. We deliberately do NOT
+    // auto-jump to another server and do NOT restart the auto-play chain —
+    // the user picked this one, let them pick the next move.
+  }, [fetchSource, playSource]);
 
   const handleSelectSubStream = useCallback((sourceId: string, streamUrl: string, _streamTitle: string, desiredLanguage?: string) => {
     autoPlayAbortedRef.current = true;
@@ -321,18 +334,24 @@ export function EmbedPlayer({ tmdbId, type, season, episode }: EmbedPlayerProps)
     }
   }, [activeSourceId, updateSourceStatus]);
 
+  // Retry JUST the failed server (offered on the per-source error card).
+  // Keeps every other server's status — no reset, no re-fetch storm.
+  const handleRetryCurrent = useCallback(async () => {
+    const sourceId = activeSourceId;
+    if (!sourceId) return;
+    autoPlayAbortedRef.current = true;
+    const status = await fetchSource(sourceId);
+    if (status.status === 'success' && status.streamUrl) {
+      playSource(sourceId, status.streamUrl);
+    }
+    // Still failed → the error card stays; the dropdown stays usable.
+  }, [activeSourceId, fetchSource, playSource]);
+
+  // FULL restart — only offered when every single server has failed (or none
+  // were loaded). Re-runs the init effect: fresh source list + fresh attempts.
   const handleRetry = useCallback(() => {
-    setSourceStatuses({});
-    setLoading(true);
-    setActiveSourceId(null);
-    setActiveStreamUrl(null);
-    setDesiredAudioLanguage(undefined);
-    setAutoOpenSourceId(null);
-    autoPlayAbortedRef.current = false;
-    pendingAutoPlayRef.current = null;
-    autoPlayIndexRef.current = 0;
-    tryAutoPlay(sourcesRef.current, 0);
-  }, [tryAutoPlay]);
+    setReloadKey(k => k + 1);
+  }, []);
 
   return (
     <div className="relative w-full bg-black" style={{ aspectRatio: '16/9' }}>
@@ -351,7 +370,9 @@ export function EmbedPlayer({ tmdbId, type, season, episode }: EmbedPlayerProps)
         />
       </div>
 
-      <div className="absolute top-2 right-2" style={{ zIndex: 2 }}>
+      {/* Server selector sits ABOVE every overlay so the user can always
+          switch servers — an error on one server must never lock the UI. */}
+      <div className="absolute top-2 right-2" style={{ zIndex: 4 }}>
         <ServerSelector
           sources={sources}
           sourceStatuses={sourceStatuses}
@@ -364,28 +385,82 @@ export function EmbedPlayer({ tmdbId, type, season, episode }: EmbedPlayerProps)
         />
       </div>
 
-      {!activeStreamUrl && loading && (
-        <div className="absolute inset-0 flex items-center justify-center bg-black/80" style={{ zIndex: 3 }}>
-          <div className="flex flex-col items-center gap-3">
-            <div className="w-8 h-8 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-            <p className="text-sm text-zinc-400">Finding best server...</p>
-          </div>
-        </div>
-      )}
+      {(() => {
+        // Backdrops are pointer-events-none so nothing ever blocks the
+        // selector; only the inner card itself captures clicks.
+        const activeSourceName = activeSourceId
+          ? sources.find(s => s.id === activeSourceId)?.name
+          : null;
+        const hasSources = sources.length > 0;
+        // "No servers available" is ONLY true when every single server
+        // failed its own check (or none were loaded). One failing server
+        // is NOT "no servers available".
+        const allSourcesFailed = hasSources
+          && sources.every(s => sourceStatuses[s.id]?.status === 'failed');
 
-      {!activeStreamUrl && !loading && (
-        <div className="absolute inset-0 flex items-center justify-center bg-black/80" style={{ zIndex: 3 }}>
-          <div className="flex flex-col items-center gap-3">
-            <p className="text-sm text-zinc-400">No servers available</p>
-            <button
-              onClick={handleRetry}
-              className="px-4 py-2 bg-white/10 hover:bg-white/20 text-white text-sm rounded-md transition-colors"
+        if (activeStreamUrl || loading) {
+          return (
+            <div
+              className="absolute inset-0 flex items-center justify-center bg-black/80"
+              style={{ zIndex: 3, pointerEvents: 'none' }}
             >
-              Retry
-            </button>
+              <div className="flex flex-col items-center gap-3">
+                <div className="w-8 h-8 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                <p className="text-sm text-zinc-400">Finding best server...</p>
+              </div>
+            </div>
+          );
+        }
+
+        if (!hasSources || allSourcesFailed) {
+          // Genuinely out of options — offer a full fresh restart.
+          return (
+            <div
+              className="absolute inset-0 flex items-center justify-center bg-black/80"
+              style={{ zIndex: 3, pointerEvents: 'none' }}
+            >
+              <div
+                className="flex flex-col items-center gap-3 rounded-lg border border-white/10 bg-black/70 px-6 py-5 backdrop-blur-sm"
+                style={{ pointerEvents: 'auto' }}
+              >
+                <p className="text-sm text-zinc-400">No servers available</p>
+                <button
+                  onClick={handleRetry}
+                  className="px-4 py-2 bg-white/10 hover:bg-white/20 text-white text-sm rounded-md transition-colors"
+                >
+                  Retry
+                </button>
+              </div>
+            </div>
+          );
+        }
+
+        // One server failed, others may be fine — say exactly that.
+        return (
+          <div
+            className="absolute inset-0 flex items-center justify-center bg-black/80"
+            style={{ zIndex: 3, pointerEvents: 'none' }}
+          >
+            <div
+              className="flex flex-col items-center gap-2 rounded-lg border border-white/10 bg-black/70 px-6 py-5 backdrop-blur-sm"
+              style={{ pointerEvents: 'auto' }}
+            >
+              <p className="text-sm font-medium text-zinc-200">
+                {activeSourceName ? `${activeSourceName} isn't responding` : 'That server failed'}
+              </p>
+              <p className="text-xs text-zinc-500">Pick another server from the list (top-right)</p>
+              {activeSourceId && (
+                <button
+                  onClick={handleRetryCurrent}
+                  className="mt-1 px-4 py-2 bg-white/10 hover:bg-white/20 text-white text-sm rounded-md transition-colors"
+                >
+                  Retry {activeSourceName || 'this server'}
+                </button>
+              )}
+            </div>
           </div>
-        </div>
-      )}
+        );
+      })()}
     </div>
   );
 }

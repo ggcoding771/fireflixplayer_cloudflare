@@ -342,8 +342,20 @@ export function ArtPlayerWrapper({
     }
   }, []);
 
+  // Instance generation counter. Every initPlayer() call bumps it; async
+  // callbacks (stall timers, retry backoffs) from older instances check it
+  // and no-op. Without this, switching servers while a source is still
+  // loading leaves the OLD source's stall timer armed — when it later fires
+  // it calls notifyError() and wrongly marks the NEW (healthy, possibly
+  // playing) source as failed, blanking the player with a false error.
+  const playerGenRef = useRef(0);
+
   const initPlayer = useCallback(() => {
     if (!artRef.current) return;
+
+    // Invalidate all timers/callbacks belonging to the previous instance
+    const gen = ++playerGenRef.current;
+    const isStale = () => gen !== playerGenRef.current;
 
     // Destroy previous instances
     if (hlsRef.current) {
@@ -787,7 +799,10 @@ export function ArtPlayerWrapper({
               // Network error — retry with backoff
               console.log(`[HLS] Retrying network load in ${backoffMs}ms...`);
               setTimeout(() => {
-                if (!errorNotifiedRef.current) hls.startLoad();
+                // Never act on behalf of a destroyed instance — the user may
+                // have already switched to a different source/server.
+                if (isStale() || errorNotifiedRef.current) return;
+                hls.startLoad();
               }, backoffMs);
               break;
             case Hls.ErrorTypes.MEDIA_ERROR:
@@ -810,6 +825,9 @@ export function ArtPlayerWrapper({
       // already has data (readyState >= 2) or any buffered range, the stream is
       // fine — it's just paused waiting for the user (autoplay blocked).
       stallTimeout = setTimeout(() => {
+        // Orphaned timer from a previous source — the user switched servers
+        // before this one finished loading. Never blame the current source.
+        if (isStale()) return;
         const vid = art.video;
         const hasData = vid.readyState >= 2 || vid.buffered.length > 0;
         if (!hasStartedPlaying && !hasData) {
@@ -860,6 +878,8 @@ export function ArtPlayerWrapper({
 
   useEffect(() => {
     return () => {
+      // Kill any orphaned timers from the last instance before unmounting
+      playerGenRef.current++;
       if (hlsRef.current) {
         hlsRef.current.destroy();
         hlsRef.current = null;
