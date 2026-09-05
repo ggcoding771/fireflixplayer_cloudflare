@@ -246,7 +246,20 @@ export async function GET(request: NextRequest) {
     // Manual redirect following: keeps Range (and every other header) on every
     // hop — the runtime's auto-follow drops Range, which broke seeking on any
     // CDN that 302s before serving bytes (Lyra's abrtech → cdn.ir chain).
-    const response = await fetchFollowingRedirects(targetUrl, headers);
+    // Segment fetches through the Space's parallel-range booster (boost=1)
+    // can legitimately take 20-60s when the CDN's per-IP throttle is warm
+    // (acek-cdn: cold burst ~600KB/s, hot ~50-90KB/s; the booster re-fetches
+    // 6 parallel ranges server-side). The old 30s cap aborted those mid-flight
+    // and returned 502s that hls.js counted as failed fragments — retries
+    // re-heated the throttle and the death-spiral "loading forever" followed.
+    // 75s lets a warm-but-alive segment land; hls.js's own 45s frag timeout
+    // still aborts hopeless ones from the browser side.
+    const isBoostedSpaceSegment = /\/proxy_range\?/.test(targetUrl) && /boost=1/.test(targetUrl) && !isM3U8Content(targetUrl, '');
+    const response = await fetchFollowingRedirects(
+      targetUrl,
+      headers,
+      isBoostedSpaceSegment ? 75000 : 30000
+    );
 
     if (!response.ok) {
       // Pass upstream errors through faithfully — hls.js and the <video>

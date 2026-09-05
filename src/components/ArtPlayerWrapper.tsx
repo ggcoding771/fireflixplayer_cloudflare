@@ -436,8 +436,15 @@ export function ArtPlayerWrapper({
 
     if (isHls && Hls.isSupported()) {
       const hls = new Hls({
-        maxBufferLength: 30,
-        maxMaxBufferLength: 60,
+        // ── Bank-while-cool buffer policy ────────────────────────────────
+        // acek-cdn (Comet) throttles the Space's egress per-IP-aggregate:
+        // cold burst ~600KB/s, sustained-hot ~50-90KB/s vs ~211KB/s needed
+        // for 720p. A 90s forward buffer banks ~2 minutes of video while the
+        // IP is cool, then drains through the hot windows while hls.js's
+        // patient loader (45s/8 retries) keeps catching up in bursts.
+        maxBufferLength: 90,
+        maxMaxBufferLength: 120,
+        maxBufferSize: 90 * 1000 * 1000,
         startLevel: -1,
         enableWorker: true,
         lowLatencyMode: false,
@@ -898,8 +905,9 @@ export function ArtPlayerWrapper({
         }
         console.log('[Player] Direct file failed before data — retrying as HLS...');
         const fhls = new Hls({
-          maxBufferLength: 30,
-          maxMaxBufferLength: 60,
+          maxBufferLength: 90,
+          maxMaxBufferLength: 120,
+          maxBufferSize: 90 * 1000 * 1000,
           startLevel: -1,
           enableWorker: true,
           lowLatencyMode: false,

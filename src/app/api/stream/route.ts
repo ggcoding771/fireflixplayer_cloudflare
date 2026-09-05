@@ -629,8 +629,66 @@ async function fetchStreamForge(
   }
 
   try {
-    const response = await fetch(url, { signal: AbortSignal.timeout(30000) });
-    const data = await response.json();
+    // ── Meteor (stycanine): Showbox/FebBox via the public stycanine1
+    // TMDB-Embed-API deployment, fetched WORKER-side. Why not through our
+    // Space like everything else? HF's own infra 429s Space→Space requests
+    // after a handful of calls (verified: even /api/health 429s from the
+    // Space's egress while browser/CF egress gets 200s — x-proxied-replica
+    // headers). The aggregator carries the FEBBOX_COOKIES its FebBox player
+    // API needs and returns signed hls.shegu.net masters. shegu.net serves
+    // masters AND segments fine from CF Workers (verified 200 + full playlist
+    // rewrite through this exact /api/proxy), so results need no Space hop.
+    let data: any;
+    if (sourceKey === 'stycanine') {
+      const kind = type === 'tv' ? 'series' : 'movie';
+      let styUrl = `https://stycanine1-tmdb-embed-api.hf.space/api/streams/showbox/${kind}/${encodeURIComponent(tmdbId)}`;
+      if (type === 'tv' && season && episode) {
+        styUrl += `?season=${encodeURIComponent(season)}&episode=${encodeURIComponent(episode)}`;
+      }
+      const styResp = await fetch(styUrl, { signal: AbortSignal.timeout(25000) });
+      if (!styResp.ok) {
+        return {
+          sourceId: `sf-${sourceKey}`,
+          sourceName: sourceKey,
+          success: false,
+          url: null,
+          rawUrl: null,
+          audioTracks: [],
+          qualities: [],
+          languageFlags: '',
+          elapsedMs: Date.now() - startTime,
+          error: `Showbox aggregator HTTP ${styResp.status}`,
+          needsProxy: true,
+        };
+      }
+      const sty = await styResp.json() as { success?: boolean; streams?: Array<{ url?: string; title?: string; quality?: string }> };
+      const seen = new Set<string>();
+      const results: Array<{ source: string; title: string; quality: string; language: string; url: string; type: string }> = [];
+      for (const s of sty.streams || []) {
+        const u = s?.url || '';
+        // m3u8 masters only — the /vip/ extensionless entries are raw MKVs
+        if (!u.includes('.m3u8')) continue;
+        const m = /shegu\.net\/(\d+)\.m3u8/.exec(u);
+        const key = m ? m[1] : u;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        let q = s.quality || 'Auto';
+        if (q === 'ORG') q = 'Auto';
+        results.push({
+          source: 'Showbox',
+          title: `Showbox - ${(s.title || 'stream').slice(0, 48)}`,
+          quality: q,
+          language: 'English',
+          url: u,
+          type: 'm3u8',
+        });
+        if (results.length >= 4) break;
+      }
+      data = { success: results.length > 0, results };
+    } else {
+      const response = await fetch(url, { signal: AbortSignal.timeout(30000) });
+      data = await response.json();
+    }
     const elapsedMs = Date.now() - startTime;
 
     if (data.success && data.results && data.results.length > 0) {
@@ -729,7 +787,11 @@ async function fetchStreamForge(
       // browser RAW so the user's own IP fetches manifest+segments. Do NOT
       // probe or fail-fast-parse it from the Worker — a Worker-side 403 is a
       // false negative for a stream the browser can play.
-      const browserDirect = sourceKey === 'movix';
+      // yamie (Nova) is the same shape: vidrift sends ACAO: * on playlist
+      // AND segments — the Space already validated the #EXTM3U at scrape
+      // time, so handing the raw URL to the browser is both safe and
+      // ~4MB/s+ fast (measured), with zero proxy load.
+      const browserDirect = sourceKey === 'movix' || sourceKey === 'yamie';
 
       // ── Direct-file candidates: probe them (in parallel) and promote the
       // first LIVE one to primary (fsonic's first result is often a dead file).
@@ -1503,13 +1565,15 @@ async function fetchMissourimonsterCombined(type: string, tmdbId: string, season
 
 async function fetchStreamForgeCombined(type: string, tmdbId: string, season: string, episode: string, externalSignal?: AbortSignal): Promise<StreamData | null> {
   try {
-    // Fast, HF-reliable subset for combined (embed) mode — the full 15-source
+    // Fast, HF-reliable subset for combined (embed) mode — the full 17-source
     // fanout can exceed the combined timeout. HF/CF-blocked sources are skipped
-    // (movix's CDN challenges all datacenter egress → browser-direct only in
-    // per-source mode; netmirror's CDN 426-blocks every proxy we own).
-    // v2 order: vegamovies (user-verified #1) and movies4u (working) added;
-    // vidrock kept (routed via its proxied_url below).
-    const fastSources = 'vegamovies,movies4u,castle,meowtv,playbox,vidrock,fsonic'
+    // (movix/yamie's CDNs challenge or CORS-serve for browsers → browser-direct
+    // only in per-source mode; netmirror's CDN 426-blocks every proxy we own).
+    // v3 order: vegamovies (user-verified #1) first, then the reliable multi-
+    // language block; stycanine (Showbox) + yamie excluded from combined mode —
+    // stycanine is a third-party Space (fine per-source, adds latency combined),
+    // yamie is browser-direct (per-source only).
+    const fastSources = 'vegamovies,castle,meowtv,playbox,movies4u,vidrock,fsonic'
     let url: string
     if (type === 'tv') {
       url = `${SF_BASE}/tv/${encodeURIComponent(tmdbId)}/${encodeURIComponent(season)}/${encodeURIComponent(episode)}?sources=${fastSources}`
