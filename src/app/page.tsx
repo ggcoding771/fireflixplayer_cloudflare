@@ -125,12 +125,13 @@ function EmbedModePlayer({
           return;
         }
 
-        // Sort sources by priority — v14 source set (all StreamForge)
+        // Sort sources by priority — matches the SOURCES order in lib/sources.ts
+        // (Aries → Comet → Pluto → Neptune → Vega → Sirius → Atlas → Orion →
+        //  Titan → Moon → Lyra), based on live verification Sep 2026.
         const sorted = [...data.sources].sort((a, a2) => {
-          // castle → meowtv → playbox → movix → vidrock → fsonic → netmirror → rest
           const priorityOrder = [
-            'castle', 'meowtv', 'playbox', 'movix', 'vidrock', 'fsonic',
-            'netmirror', 'movies4u', 'persianstremio', 'vegamovies', 'hexa',
+            'vegamovies', 'movies4u', 'castle', 'meowtv', 'playbox', 'hexa',
+            'vidrock', 'movix', 'fsonic', 'netmirror', 'persianstremio',
             'vidfast', 'vidup', 'lookmovie', 'lmscript',
           ];
           const idx = (s: EmbedStreamSource) => {

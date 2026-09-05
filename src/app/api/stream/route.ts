@@ -115,8 +115,10 @@ const MM_BASE = 'https://missourimonster-vyla.hf.space';
 // "Invalid auth_key") long after the link dies. Token-bearing results get a
 // 45-minute TTL instead, and a stale token entry is re-fetched synchronously
 // (serving it would guarantee a broken playback).
+// `sign` also covers netmirror (sign=…&t=<unix expiry>, ~3h) and R2 AWS
+// signatures — those were previously cached for 2 days.
 const TOKEN_CACHE_TTL = 45 * 60; // 45 minutes
-const TOKEN_HINT_RE = /auth_key|expire|token|md5/i;
+const TOKEN_HINT_RE = /auth_key|expire|token|md5|sign/i;
 
 function hasTokenUrls(result: unknown): boolean {
   try {
@@ -661,14 +663,63 @@ async function fetchStreamForge(
         }
       }
 
+      // ── Lyra (persianstremio): keep only browser-decodable files. Most of
+      // its dumps are x265/HEVC 10-bit MKVs — browsers decode the audio track
+      // but NOT the video ("audio only" / dead 4K reports). Drop anything
+      // whose title/URL screams HEVC/10bit/2160p, and prefer .mp4 + x264
+      // entries first so the auto-selected primary is the safest file.
+      if (sourceKey === 'persianstremio') {
+        const browserUnplayable = /x265|x\.?265|hevc|10[-. ]?bit|2160p|\b4k\b/i;
+        const playable = filteredResults.filter(
+          (r: { title?: string; url?: string; quality?: string }) => {
+            const hay = `${r.title || ''} ${r.url || ''} ${r.quality || ''}`;
+            return !browserUnplayable.test(hay);
+          }
+        );
+        if (playable.length > 0) {
+          const rank = (r: { url?: string; title?: string; quality?: string }) => {
+            const hay = `${r.url || ''} ${r.title || ''}`.toLowerCase();
+            if (/\.mp4(\?|$)/.test(hay) || hay.includes('.mp4')) return 0;
+            if (hay.includes('x264') || hay.includes('h264') || hay.includes('h.264')) return 1;
+            if (hay.includes('720') || hay.includes('480')) return 2;
+            return 3;
+          };
+          playable.sort((a, b) => rank(a) - rank(b));
+          filteredResults = playable;
+        } else {
+          return {
+            sourceId: `sf-${sourceKey}`,
+            sourceName: sourceKey,
+            success: false,
+            url: null,
+            rawUrl: null,
+            audioTracks: [],
+            qualities: [],
+            languageFlags: '',
+            elapsedMs,
+            error: 'All files are HEVC/x265 (undecodable in browsers)',
+            needsProxy: true,
+          };
+        }
+      }
+
+      // ── Browser-direct policy (movix): free.finepulfe.xyz 403-challenges
+      // every datacenter egress (CF Workers, HF) but serves real browsers and
+      // sends Access-Control-Allow-Origin: *. The m3u8 is handed to the
+      // browser RAW so the user's own IP fetches manifest+segments. Do NOT
+      // probe or fail-fast-parse it from the Worker — a Worker-side 403 is a
+      // false negative for a stream the browser can play.
+      const browserDirect = sourceKey === 'movix';
+
       // ── Direct-file candidates: probe them (in parallel) and promote the
       // first LIVE one to primary (fsonic's first result is often a dead file).
       // proxy_range-wrapped URLs are skipped — probing burns their token.
-      // ALL-DEAD = fail this source NOW with the real HTTP status instead of
-      // handing the player a URL that can only spin forever (Moon's CDN
-      // 427-blocks every proxy egress we own — the user sees "failed" in
-      // ~10s and the auto-chain moves on to the next server).
-      const directCandidates = filteredResults.filter(
+      // ALL-DEAD = drop the dead directs; the source only FAILS if no m3u8
+      // results remain (vidrock TV returns m3u8s + dead mp4s — the m3u8s are
+      // perfectly playable, the old code killed the whole source).
+      // (Statuses: 404/410 = dead file, 426/427 = CDN blocks our egress,
+      // null = timeout/unreachable.) NOT cached — a later click re-probes.
+      const directCandidates = browserDirect ? [] : filteredResults.filter(
         (r: { type?: string; url?: string }) =>
           (r.type === 'direct' || r.type === 'mp4') &&
           !(r.url || '').includes('/proxy_range')
@@ -685,29 +736,33 @@ async function fetchStreamForge(
             filteredResults.unshift(winner);
           }
         } else {
-          // Every direct file refused the probe — playback from CF Workers
-          // egress is impossible, so this source is dead *right now*.
-          // (Statuses: 404/410 = dead file, 426/427 = CDN blocks our egress,
-          // null = timeout/unreachable.) NOT cached — a later click re-probes.
-          const blocked = deadStatuses.find(s => s === 426 || s === 427);
-          const statusHint = blocked
-            ? `CDN blocks our proxy (HTTP ${blocked})`
-            : deadStatuses.find(s => s && s >= 400)
-              ? `files unavailable (HTTP ${deadStatuses.find(s => s && s >= 400)})`
-              : 'files unreachable';
-          return {
-            sourceId: `sf-${sourceKey}`,
-            sourceName: sourceKey,
-            success: false,
-            url: null,
-            rawUrl: null,
-            audioTracks: [],
-            qualities: [],
-            languageFlags: '',
-            elapsedMs,
-            error: statusHint,
-            needsProxy: true,
-          };
+          // Every probed direct file refused. Drop them and keep any m3u8
+          // results alive; only fail the source when nothing playable remains.
+          const deadUrls = new Set(directCandidates.map((r: { url?: string }) => r.url || ''));
+          filteredResults = filteredResults.filter(
+            (r: { url?: string; type?: string }) => !deadUrls.has(r.url || '')
+          );
+          if (filteredResults.length === 0) {
+            const blocked = deadStatuses.find(s => s === 426 || s === 427);
+            const statusHint = blocked
+              ? `CDN blocks our proxy (HTTP ${blocked})`
+              : deadStatuses.find(s => s && s >= 400)
+                ? `files unavailable (HTTP ${deadStatuses.find(s => s && s >= 400)})`
+                : 'files unreachable';
+            return {
+              sourceId: `sf-${sourceKey}`,
+              sourceName: sourceKey,
+              success: false,
+              url: null,
+              rawUrl: null,
+              audioTracks: [],
+              qualities: [],
+              languageFlags: '',
+              elapsedMs,
+              error: statusHint,
+              needsProxy: true,
+            };
+          }
         }
       }
 
@@ -729,14 +784,16 @@ async function fetchStreamForge(
       );
       const primary = multiStream || englishStream || m3u8Preferred || filteredResults[0];
 
-      // ── Castle-family (castle + meowtv): their m3u8 auth_keys are minted for
-      // the StreamForge Space's OWN egress IP — every other IP (CF Workers,
-      // user browsers, other HF spaces) gets 403 "Invalid auth_key". The API
-      // returns a `proxied_url` that flows through the Space's own proxy (same
-      // egress), so those sources MUST use it. Other sources (fsonic etc.) work
-      // better through the local CF proxy — VK-kcdn throws for HF egress — so
-      // they keep the raw URL.
-      const needsSpaceProxy = sourceKey === 'castle' || sourceKey === 'meowtv';
+      // ── Space-proxy family (castle + meowtv + vidrock): these CDNs either
+      // mint auth_keys for the StreamForge Space's OWN egress IP (castle —
+      // every other IP gets 403 "Invalid auth_key") or are Cloudflare-proxied
+      // zones (vidrock's ngcorp.dad — CF Worker fetch → Cdn-Loop 503 "error
+      // 1102"). The API returns a `proxied_url` flowing through the Space's
+      // own proxy (HF egress, verified 200 + segment rewrite), so these
+      // sources MUST use it. Other sources (fsonic etc.) work better through
+      // the local CF proxy — VK-kcdn throws for HF egress — so they keep the
+      // raw URL.
+      const needsSpaceProxy = sourceKey === 'castle' || sourceKey === 'meowtv' || sourceKey === 'vidrock';
       const effectiveUrl = (r: { url?: string; proxied_url?: string }): string =>
         needsSpaceProxy && r.proxied_url ? r.proxied_url : (r.url || '');
 
@@ -858,8 +915,11 @@ async function fetchStreamForge(
         // auto-chain picks the next server instead of spinning forever
         // (Comet/acek-cdn serves exactly this when their origin is down).
         // Timeouts/network throws are NOT definitive — keep the stream.
+        // BROWSER-DIRECT sources (movix) skip this too: the Worker cannot
+        // fetch their CDN (403 challenge) — the browser can. A Worker-side
+        // failure here would be a false negative.
         const isDirectPrimary = primary.type === 'direct' || primary.type === 'mp4';
-        if (!isDirectPrimary) {
+        if (!isDirectPrimary && !browserDirect) {
           try {
             const parseUrl = selfOrigin
               ? `${selfOrigin}${buildProxyUrl(primaryUrl, headers)}`
@@ -1007,8 +1067,11 @@ async function fetchStreamForge(
       // NetMirror: use local /api/proxy (it auto-routes freecdn*.top through HF)
       // The local proxy detects freecdn URLs in m3u8 and routes them through HF proxy,
       // while imgcdn.kim URLs go through local proxy (fast). Best of both worlds.
-      // Other sources: also use local /api/proxy
-      const playableUrl = buildProxyUrl(primaryUrl, headers);
+      // Other sources: also use local /api/proxy.
+      // BROWSER-DIRECT sources (movix): hand the RAW url to the player — the
+      // CDN challenges datacenter egress but serves browsers (ACAO: *), so
+      // the user's own IP fetches manifest + segments directly.
+      const playableUrl = browserDirect ? primaryUrl : buildProxyUrl(primaryUrl, headers);
 
       if (multiStreams && multiStreams.length > 1) {
         for (const stream of multiStreams) {
@@ -1026,6 +1089,12 @@ async function fetchStreamForge(
               }
             } else if (!stream.url.startsWith('/api/proxy')) {
               stream.url = buildProxyUrl(stream.url, headers);
+            }
+          } else if (browserDirect) {
+            // keep raw URLs — the browser fetches these directly
+            if (stream.url.startsWith('/api/proxy')) {
+              const localMatch = stream.url.match(/[?&]url=([^&]+)/);
+              if (localMatch) stream.url = decodeURIComponent(localMatch[1]);
             }
           } else {
             if (!stream.url.startsWith('/api/proxy')) {
@@ -1408,8 +1477,12 @@ async function fetchMissourimonsterCombined(type: string, tmdbId: string, season
 async function fetchStreamForgeCombined(type: string, tmdbId: string, season: string, episode: string, externalSignal?: AbortSignal): Promise<StreamData | null> {
   try {
     // Fast, HF-reliable subset for combined (embed) mode — the full 15-source
-    // fanout can exceed the combined timeout. HF-blocked sources are skipped.
-    const fastSources = 'castle,meowtv,playbox,movix,vidrock,fsonic'
+    // fanout can exceed the combined timeout. HF/CF-blocked sources are skipped
+    // (movix's CDN challenges all datacenter egress → browser-direct only in
+    // per-source mode; netmirror's CDN 426-blocks every proxy we own).
+    // v2 order: vegamovies (user-verified #1) and movies4u (working) added;
+    // vidrock kept (routed via its proxied_url below).
+    const fastSources = 'vegamovies,movies4u,castle,meowtv,playbox,vidrock,fsonic'
     let url: string
     if (type === 'tv') {
       url = `${SF_BASE}/tv/${encodeURIComponent(tmdbId)}/${encodeURIComponent(season)}/${encodeURIComponent(episode)}?sources=${fastSources}`
@@ -1465,10 +1538,13 @@ async function fetchStreamForgeCombined(type: string, tmdbId: string, season: st
       // Castle-family sources (castle/meowtv): use the API's proxied_url — their
       // auth_keys are minted for the StreamForge Space's egress IP, so the raw
       // URL 403s from CF Workers ("Invalid auth_key").
+      // vidrock: same treatment — ngcorp.dad is a Cloudflare-proxied zone and
+      // CF Worker fetch → Cdn-Loop 503 ("error 1102"); its proxied_url flows
+      // through the Space's own egress (verified 200 + segment rewrite).
       const headers: Record<string, string> = {}
       if (r.headers) Object.assign(headers, r.headers)
-      const isCastleFamily = sourceBase === 'castle' || sourceBase === 'meowtv'
-      const rawUrl = isCastleFamily && r.proxied_url ? r.proxied_url : r.url
+      const isSpaceProxyFamily = sourceBase === 'castle' || sourceBase === 'meowtv' || sourceBase === 'vidrock'
+      const rawUrl = isSpaceProxyFamily && r.proxied_url ? r.proxied_url : r.url
       const playableUrl = buildProxyUrl(rawUrl, headers)
 
       return {
@@ -1630,11 +1706,11 @@ async function _GET(request: NextRequest) {
       )
     }
 
-    // v3: cache key versioned — bumps every entry from before the
-    // fail-fast/probe fixes (those hold "success" results for streams that
-    // can never start — Moon's CDN-blocked MP4s, Comet's dead-origin masters,
-    // and pre-proxied_url castle auth_keys from the v1/v2 era)
-    const sourceCacheKey = `v3:src:${sourceId}:${type}:${tmdbIdParam}:${season}:${episode}`
+    // v4: cache key versioned — bumps every entry from before this release:
+    // vidrock now flows through the Space proxy (Cdn-Loop 503 fix), movix is
+    // served browser-direct, persianstremio results are codec-filtered, and
+    // old v3 netmirror/vidrock failures must not shadow the new behavior.
+    const sourceCacheKey = `v4:src:${sourceId}:${type}:${tmdbIdParam}:${season}:${episode}`
 
     // Check cache: Cache API → memory → Fetch (unless nocache=1)
     if (!nocache) {
@@ -1694,7 +1770,7 @@ async function _GET(request: NextRequest) {
 
   const season = searchParams.get('season') || '1'
   const episode = searchParams.get('episode') || '1'
-  const cacheKey = `v3:cmb:${type}:${id}:${season}:${episode}`
+  const cacheKey = `v4:cmb:${type}:${id}:${season}:${episode}`
 
   // Check cache: Cache API → memory → Fetch (unless nocache=1)
   if (!nocache) {

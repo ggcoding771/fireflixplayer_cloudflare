@@ -122,6 +122,52 @@ function isVidApiCDN(url: string): boolean {
   }
 }
 
+/**
+ * Fetch a URL while following 3xx redirects MANUALLY, re-issuing the SAME
+ * headers (including Range) on every hop.
+ *
+ * WHY: the Workers runtime's automatic redirect-following drops the `Range`
+ * header across hops. Direct-file CDNs with a redirect chain (Lyra's
+ * abrtech.top → 2× 324902.ir.cdn.ir) then answer a seek request with
+ * 200 + the FULL file from byte 0 — the <video> element cannot seek and
+ * restarts buffering: the "can't jump in time" bug. curl -L preserves Range
+ * across redirects (verified 206); this replicates that behavior.
+ * Max 5 hops; redirects that point at non-http(s) targets abort the chain.
+ */
+async function fetchFollowingRedirects(
+  url: string,
+  headers: Record<string, string>,
+  timeoutMs = 30000
+): Promise<Response> {
+  let current = url;
+  for (let hop = 0; hop <= 5; hop++) {
+    const res = await fetch(current, {
+      headers,
+      redirect: 'manual',
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (res.status >= 300 && res.status < 400) {
+      const loc = res.headers.get('location');
+      if (loc) {
+        try { await res.body?.cancel(); } catch { /* already closed */ }
+        let next: string;
+        try {
+          next = new URL(loc, current).toString();
+        } catch {
+          return res; // unparseable location — surface the redirect as-is
+        }
+        if (!next.startsWith('http://') && !next.startsWith('https://')) {
+          return new Response(null, { status: 502, headers: { 'Access-Control-Allow-Origin': '*' } });
+        }
+        current = next;
+        continue;
+      }
+    }
+    return res;
+  }
+  return new Response(null, { status: 508, headers: { 'Access-Control-Allow-Origin': '*' } });
+}
+
 export async function GET(request: NextRequest) {
   const searchParams = request.nextUrl.searchParams;
   const targetUrl = searchParams.get('url');
@@ -197,10 +243,10 @@ export async function GET(request: NextRequest) {
     const clientRange = request.headers.get('range');
     if (clientRange) headers['Range'] = clientRange;
 
-    const response = await fetch(targetUrl, {
-      headers,
-      signal: AbortSignal.timeout(30000),
-    });
+    // Manual redirect following: keeps Range (and every other header) on every
+    // hop — the runtime's auto-follow drops Range, which broke seeking on any
+    // CDN that 302s before serving bytes (Lyra's abrtech → cdn.ir chain).
+    const response = await fetchFollowingRedirects(targetUrl, headers);
 
     if (!response.ok) {
       // Pass upstream errors through faithfully — hls.js and the <video>

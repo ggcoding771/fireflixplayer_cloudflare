@@ -75,128 +75,30 @@ export const LANG_FLAGS: Record<string, string> = {
 // NOTE: vidfast / vidup / lookmovie / lmscript exist in the API but their upstream
 // sites 403 both HF Spaces and Cloudflare Worker egress — they are NOT listed here.
 
+// Server order — updated Sep 2026 after live testing every source against
+// TMDB 335984 (movie) + 1396/1/1 (TV) through the production chain, plus the
+// user's own playback reports:
+//
+//   VERIFIED WORKING (user-tested + our chain tests):
+//     Aries (vegamovies)  — direct MKV from R2/hubcloud, multi-audio Hindi/English
+//     Comet (movies4u)    — 4 languages, token flows through the Space proxy
+//     Pluto (castle)      — multi-language m3u8 (OST/Hindi/…)
+//     Neptune (meowtv)    — castle-CDN family, multi
+//     Vega (playbox)      — multi-quality m3u8
+//     Sirius (hexa)       — works; CF-challenge is flaky per-request
+//   FIXED THIS RELEASE:
+//     Atlas (vidrock)     — ngcorp.dad is CF-proxied → Cdn-Loop 503 killed it
+//                           from the Worker; now routed via the Space proxy
+//     Orion (movix)       — CDN challenges all datacenter egress; now served
+//                           browser-direct (residential IPs pass the challenge)
+//     Lyra (persianstremio) — x265/10bit/4K MKVs are undecodable in browsers
+//                           (audio-only / black screen); filtered to H.264-family
+//                           files + proxy now preserves Range across 302 hops (seek)
+//   KNOWN-BLOCKED (kept listed, never auto-first):
+//     Moon (netmirror)    — see note on its entry
+
 export const SOURCES: SourceConfig[] = [
-  // === 1. Moon (NetMirror) — Top priority, multi-language ===
-  {
-    id: 'sf-netmirror',
-    name: 'Moon',
-    apiOrigin: 'streamforge',
-    apiSourceKey: 'netmirror',
-    languageFlags: '🌍',
-    languages: ['en', 'hi', 'ta', 'te', 'es', 'fr', 'de', 'ja', 'ko', 'ar', 'ru', 'th', 'vi', 'id', 'it', 'pt', 'pl', 'tr', 'uk', 'multi'],
-    // Auto-play order demoted from 1 → 7.5: with the CDN egress-blocked the
-    // fail-fast probe costs ~15s on every title when tried first; Pluto (2)
-    // starts instantly. Still fully listed & manually selectable — the moment
-    // net27 restores HLS (or the CDN unblocks CF egress), promote it back.
-    order: 7.5,
-    reliability: 'medium',
-    note: 'net27.cc switched upstreams: old 30+ language HLS is dead (their /api/loffe fallback is broken server-side); now serves multi-audio MP4s from bcdnxw.hakunaymatata.com which 426/427-blocks HF+CF proxy egress (verified Sep 2026). Fail-fast probe marks it failed until their CDN unblocks or HLS returns. Some older titles genuinely missing (e.g. Venom 2018)',
-  },
-  // === 2. Pluto (Castle) — multi-language ===
-  {
-    id: 'sf-castle',
-    name: 'Pluto',
-    apiOrigin: 'streamforge',
-    apiSourceKey: 'castle',
-    languageFlags: '🇺🇸🇮🇳',
-    languages: ['en', 'hi', 'ta', 'te', 'multi'],
-    order: 2,
-    reliability: 'high',
-  },
-  // === 3. Neptune (MeowTV) — castle-CDN family, multi-language (replaces dead vidnest) ===
-  {
-    id: 'sf-meowtv',
-    name: 'Neptune',
-    apiOrigin: 'streamforge',
-    apiSourceKey: 'meowtv',
-    languageFlags: '🇮🇳🌍',
-    languages: ['hi', 'en', 'ta', 'te', 'multi'],
-    order: 3,
-    reliability: 'high',
-    note: 'api.meowtv.ru (hindiv3) — Castle-CDN streams, movie+TV',
-  },
-  // === 4. Vega (PlayBox) — multi-quality m3u8 (was direct-vidapi, same backend API) ===
-  {
-    id: 'sf-playbox',
-    name: 'Vega',
-    apiOrigin: 'streamforge',
-    apiSourceKey: 'playbox',
-    languageFlags: '🇺🇸',
-    languages: ['en', 'multi'],
-    order: 4,
-    reliability: 'high',
-  },
-  // === 5. Orion (Movix) — 1080p+ up to 1440p multi ===
-  {
-    id: 'sf-movix',
-    name: 'Orion',
-    apiOrigin: 'streamforge',
-    apiSourceKey: 'movix',
-    languageFlags: '🇺🇸',
-    languages: ['en', 'multi'],
-    order: 5,
-    reliability: 'high',
-  },
-  // === 6. Atlas (VidRock) — multi-server movies + TV ===
-  {
-    id: 'sf-vidrock',
-    name: 'Atlas',
-    apiOrigin: 'streamforge',
-    apiSourceKey: 'vidrock',
-    languageFlags: '🇺🇸',
-    languages: ['en'],
-    order: 6,
-    reliability: 'high',
-    note: 'ngcorp.dad / flamingo workers m3u8 — movies verified; some TV servers 403',
-  },
-  // === 7. Titan (Fsonic) — direct MP4 720/1080 (replaces dead mm-vidrock) ===
-  {
-    id: 'sf-fsonic',
-    name: 'Titan',
-    apiOrigin: 'streamforge',
-    apiSourceKey: 'fsonic',
-    languageFlags: '🇺🇸',
-    languages: ['en'],
-    order: 7,
-    reliability: 'medium',
-    note: 'fsharetv.co direct MP4 — movies only',
-  },
-  // === 8. Comet (Movies4u) — Hindi/English acek-cdn + hubcloud ===
-  {
-    id: 'sf-movies4u',
-    name: 'Comet',
-    apiOrigin: 'streamforge',
-    apiSourceKey: 'movies4u',
-    languageFlags: '🇮🇳',
-    languages: ['hi', 'en', 'multi'],
-    order: 8,
-    reliability: 'medium',
-    note: 'm4uplay/acek-cdn: tokens are ASN-stamped by m4uplay.store (AWS 14618 = the StreamForge Space) and served via the Space proxy — works when the acek origin is healthy (4 languages: hi/ta/te/en), 500/502 when their origin is down (title-specific); fail-fast detects it',
-  },
-  // === 9. Lyra (PersianStremio) — direct MKV up to 4K ===
-  {
-    id: 'sf-persianstremio',
-    name: 'Lyra',
-    apiOrigin: 'streamforge',
-    apiSourceKey: 'persianstremio',
-    languageFlags: '🌍',
-    languages: ['multi', 'fa'],
-    order: 9,
-    reliability: 'high',
-  },
-  // === 10. Sirius (Hexa) — intermittent ===
-  {
-    id: 'sf-hexa',
-    name: 'Sirius',
-    apiOrigin: 'streamforge',
-    apiSourceKey: 'hexa',
-    languageFlags: '🇺🇸',
-    languages: ['en'],
-    order: 10,
-    reliability: 'low',
-    note: 'dragonballzfans CDNs — intermittent availability',
-  },
-  // === 11. Aries (VegaMovies) — Hindi multi-host MKV up to 4K ===
+  // === 1. Aries (VegaMovies) — user-verified best; direct multi-audio MKV ===
   {
     id: 'sf-vegamovies',
     name: 'Aries',
@@ -204,8 +106,127 @@ export const SOURCES: SourceConfig[] = [
     apiSourceKey: 'vegamovies',
     languageFlags: '🇮🇳',
     languages: ['hi', 'en', 'multi'],
-    order: 11,
+    order: 1,
+    reliability: 'high',
+    note: 'hubcloud R2/hub2 direct MKV (Hindi-English dual audio). TV episode files now name-verified upstream (S01E01 no longer resolves to S05E01 files).',
+  },
+  // === 2. Comet (Movies4u) — user-verified working; 4 languages ===
+  {
+    id: 'sf-movies4u',
+    name: 'Comet',
+    apiOrigin: 'streamforge',
+    apiSourceKey: 'movies4u',
+    languageFlags: '🇮🇳',
+    languages: ['hi', 'en', 'ta', 'te', 'multi'],
+    order: 2,
+    reliability: 'high',
+    note: 'm4uplay/acek-cdn tokens are ASN-stamped by m4uplay.store and served via the Space proxy (4 languages: hi/ta/te/en). Title-specific 500/502 when their origin is down — fail-fast detects it.',
+  },
+  // === 3. Pluto (Castle) — multi-language m3u8 ===
+  {
+    id: 'sf-castle',
+    name: 'Pluto',
+    apiOrigin: 'streamforge',
+    apiSourceKey: 'castle',
+    languageFlags: '🇺🇸🇮🇳',
+    languages: ['en', 'hi', 'ta', 'te', 'multi'],
+    order: 3,
+    reliability: 'high',
+  },
+  // === 4. Neptune (MeowTV) — castle-CDN family, multi-language ===
+  {
+    id: 'sf-meowtv',
+    name: 'Neptune',
+    apiOrigin: 'streamforge',
+    apiSourceKey: 'meowtv',
+    languageFlags: '🇮🇳🌍',
+    languages: ['hi', 'en', 'ta', 'te', 'multi'],
+    order: 4,
+    reliability: 'high',
+    note: 'api.meowtv.ru (hindiv3) — Castle-CDN streams, movie+TV',
+  },
+  // === 5. Vega (PlayBox) — multi-quality m3u8 ===
+  {
+    id: 'sf-playbox',
+    name: 'Vega',
+    apiOrigin: 'streamforge',
+    apiSourceKey: 'playbox',
+    languageFlags: '🇺🇸',
+    languages: ['en', 'multi'],
+    order: 5,
+    reliability: 'high',
+  },
+  // === 6. Sirius (Hexa) — works, intermittent challenge ===
+  {
+    id: 'sf-hexa',
+    name: 'Sirius',
+    apiOrigin: 'streamforge',
+    apiSourceKey: 'hexa',
+    languageFlags: '🇺🇸',
+    languages: ['en'],
+    order: 6,
     reliability: 'medium',
+    note: 'dragonballzfans CDNs — upstream CF-challenge intermittently fails per-request; retrying usually works',
+  },
+  // === 7. Atlas (VidRock) — fixed: Space-proxy routing beats the Cdn-Loop 503 ===
+  {
+    id: 'sf-vidrock',
+    name: 'Atlas',
+    apiOrigin: 'streamforge',
+    apiSourceKey: 'vidrock',
+    languageFlags: '🇺🇸',
+    languages: ['en'],
+    order: 7,
+    reliability: 'high',
+    note: 'ngcorp.dad / flamingo workers m3u8. ngcorp.dad is Cloudflare-proxied — CF Worker fetch → Cdn-Loop 503 (error 1102); now routed through the StreamForge Space proxy like castle/meowtv.',
+  },
+  // === 8. Orion (Movix) — browser-direct (CDN challenges datacenter egress) ===
+  {
+    id: 'sf-movix',
+    name: 'Orion',
+    apiOrigin: 'streamforge',
+    apiSourceKey: 'movix',
+    languageFlags: '🇺🇸',
+    languages: ['en', 'multi'],
+    order: 8,
+    reliability: 'medium',
+    note: 'free.finepulfe.xyz 403-challenges CF/HF/datacenter egress but sends Access-Control-Allow-Origin: * — the raw m3u8 is served browser-direct so the user\u2019s residential IP fetches it.',
+  },
+  // === 9. Titan (Fsonic) — direct MP4, movies only ===
+  {
+    id: 'sf-fsonic',
+    name: 'Titan',
+    apiOrigin: 'streamforge',
+    apiSourceKey: 'fsonic',
+    languageFlags: '🇺🇸',
+    languages: ['en'],
+    order: 9,
+    reliability: 'medium',
+    note: 'fsharetv.co direct MP4 — movies only',
+  },
+  // === 10. Moon (NetMirror) — CDN blocks every proxy egress we own ===
+  {
+    id: 'sf-netmirror',
+    name: 'Moon',
+    apiOrigin: 'streamforge',
+    apiSourceKey: 'netmirror',
+    languageFlags: '🌍',
+    languages: ['en', 'hi', 'ta', 'te', 'es', 'fr', 'de', 'ja', 'ko', 'ar', 'ru', 'th', 'vi', 'id', 'it', 'pt', 'pl', 'tr', 'uk', 'multi'],
+    order: 10,
+    reliability: 'low',
+    note: 'net27.cc now serves multi-audio MP4s from bcdnxw.hakunaymatata.com (Alibaba CDN). That CDN REQUIRES Referer "https://videodownloader.site/" (browsers cannot send it → 429) AND 426/427-blocks every proxy egress we own (CF Workers 427, HF Spaces 426, Vercel 426). Unfixable until a relay on an allowed network exists (e.g. Alibaba Cloud). Fail-fast reports it honestly in ~2s.',
+  },
+  // === 11. Lyra (PersianStremio) — demoted: mostly HEVC/x265 MKVs ===
+  {
+    id: 'sf-persianstremio',
+    name: 'Lyra',
+    apiOrigin: 'streamforge',
+    apiSourceKey: 'persianstremio',
+    languageFlags: '🌍',
+    languages: ['multi', 'fa'],
+    order: 11,
+    reliability: 'low',
+    note: 'Direct MKV dumps. Most entries are x265/HEVC 10-bit — browsers decode audio but not video (the "only audio" / dead 4K reports). Player filters to H.264-family files and the proxy now preserves Range across the CDN\u2019s 302 hops (seeking fixed). Upstream API itself 503s often.',
   },
 ];
 
