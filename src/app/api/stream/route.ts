@@ -802,7 +802,14 @@ async function fetchStreamForge(
       const m3u8Preferred = filteredResults.find(
         (r: { type?: string }) => (r.type || 'm3u8') === 'm3u8'
       );
-      const primary = multiStream || englishStream || m3u8Preferred || filteredResults[0];
+      // VegaMovies files are DUAL-AUDIO (Hindi-English): the language-preference
+      // chain below is meaningless there and actively harmful — the space
+      // labels extensionless r2.dev hashes "English" while the named dual-audio
+      // MKVs get "Hindi", so englishStream used to skip the ranked-best file
+      // and pick the hash URL. Respect the vegaRank ordering instead.
+      const primary = sourceKey === 'vegamovies'
+        ? (m3u8Preferred || filteredResults[0])
+        : (multiStream || englishStream || m3u8Preferred || filteredResults[0]);
 
       // ── Space-proxy family (castle + meowtv + vidrock): these CDNs either
       // mint auth_keys for the StreamForge Space's OWN egress IP (castle —
