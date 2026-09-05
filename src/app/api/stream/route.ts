@@ -54,7 +54,7 @@ async function cacheApiGet(key: string): Promise<{ data: string; age: number } |
   }
 }
 
-async function cacheApiPut(key: string, data: string): Promise<void> {
+async function cacheApiPut(key: string, data: string, ttlSeconds: number = 259200): Promise<void> {
   const cache = getCacheApi();
   if (!cache) return;
   try {
@@ -62,7 +62,7 @@ async function cacheApiPut(key: string, data: string): Promise<void> {
     const resp = new Response(data, {
       headers: {
         'X-Cache-Timestamp': Math.floor(Date.now() / 1000).toString(),
-        'Cache-Control': 'public, max-age=259200', // 3 days — Cache API uses this for eviction
+        'Cache-Control': `public, max-age=${ttlSeconds}`,
         'Content-Type': 'application/json',
       },
     });
@@ -96,9 +96,9 @@ async function cacheGet(key: string): Promise<{ data: string; age: number; layer
  * Write to Cache API + memory fallback.
  * Cache API is unlimited — no need to worry about write quotas!
  */
-async function cachePut(key: string, data: string): Promise<void> {
+async function cachePut(key: string, data: string, ttlSeconds: number = 259200): Promise<void> {
   // Write to Cache API (free, unlimited — write as much as you want!)
-  await cacheApiPut(key, data);
+  await cacheApiPut(key, data, ttlSeconds);
   // Also write to memory cache as fallback
   if (memoryCache.size >= MEMORY_CACHE_MAX) {
     const oldest = memoryCache.keys().next().value;
@@ -108,6 +108,29 @@ async function cachePut(key: string, data: string): Promise<void> {
 }
 
 const MM_BASE = 'https://missourimonster-vyla.hf.space';
+
+// ─── Token-aware cache TTL ──────────────────────────────────────────────────
+// Castle/meowtv/movix-style CDNs sign URLs with auth_key/expire params that
+// live ~2.5-3h. Caching such results for 2 DAYS serves dead tokens (403
+// "Invalid auth_key") long after the link dies. Token-bearing results get a
+// 45-minute TTL instead, and a stale token entry is re-fetched synchronously
+// (serving it would guarantee a broken playback).
+const TOKEN_CACHE_TTL = 45 * 60; // 45 minutes
+const TOKEN_HINT_RE = /auth_key|expire|token|md5/i;
+
+function hasTokenUrls(result: unknown): boolean {
+  try {
+    const r = result as { url?: string | null; rawUrl?: string | null; multiStreams?: Array<{ url: string }> };
+    const urls = [r.url || '', r.rawUrl || '', ...(r.multiStreams || []).map(s => s.url || '')];
+    return urls.some(u => TOKEN_HINT_RE.test(u));
+  } catch {
+    return false;
+  }
+}
+
+function sourcesHaveTokens(sources: Array<{ url?: string }>): boolean {
+  return (sources || []).some(s => TOKEN_HINT_RE.test(s.url || ''));
+}
 const SF_BASE = 'https://epiccodergg-streamforge-api.hf.space';
 const HF_PROXY_BASE = 'https://epiccodergg-fireflix-api.hf.space';
 
@@ -1517,7 +1540,9 @@ async function _GET(request: NextRequest) {
       )
     }
 
-    const sourceCacheKey = `src:${sourceId}:${type}:${tmdbIdParam}:${season}:${episode}`
+    // v2: cache key versioned — bumps orphan every entry from before the
+    // proxied_url fix (those hold dead castle auth_keys)
+    const sourceCacheKey = `v2:src:${sourceId}:${type}:${tmdbIdParam}:${season}:${episode}`
 
     // Check cache: Cache API → memory → Fetch (unless nocache=1)
     if (!nocache) {
@@ -1525,12 +1550,22 @@ async function _GET(request: NextRequest) {
       if (cached) {
         const result = JSON.parse(cached.data) as StreamResult
         if (result.success) {
-          console.log(`[Stream API] Per-source ${cached.layer} HIT: ${sourceCacheKey} (age: ${cached.age}s)`)
-          // Stale-while-revalidate: if >2 days old, refresh in background (still serve cached)
-          if (cached.age > CACHE_TTL) {
-            refreshSourceInBackground(sourceConfig, tmdbIdParam, type, season, episode, sourceCacheKey)
+          const tokenized = hasTokenUrls(result)
+          const effectiveTtl = tokenized ? TOKEN_CACHE_TTL : CACHE_TTL
+          console.log(`[Stream API] Per-source ${cached.layer} HIT: ${sourceCacheKey} (age: ${cached.age}s, ttl: ${effectiveTtl}s${tokenized ? ', token-based' : ''})`)
+          if (cached.age > effectiveTtl) {
+            if (tokenized) {
+              // Stale signed URL = guaranteed 403 at playback. Never serve it —
+              // re-scrape synchronously for a fresh token.
+              console.log(`[Stream API] Token entry stale — re-fetching fresh: ${sourceCacheKey}`)
+            } else {
+              // Stale-while-revalidate: refresh in background (still serve cached)
+              refreshSourceInBackground(sourceConfig, tmdbIdParam, type, season, episode, sourceCacheKey)
+            }
           }
-          return buildCachedResponse(result, `HIT-${cached.layer}`, cached.age.toString())
+          if (!tokenized || cached.age <= effectiveTtl) {
+            return buildCachedResponse(result, `HIT-${cached.layer}`, cached.age.toString())
+          }
         }
       }
     }
@@ -1544,8 +1579,9 @@ async function _GET(request: NextRequest) {
 
     // Cache successful results (Cache API — unlimited, free!)
     if (result.success) {
-      await cachePut(sourceCacheKey, JSON.stringify(result))
-      console.log(`[Stream API] Cached per-source: ${sourceCacheKey}`)
+      const ttl = hasTokenUrls(result) ? TOKEN_CACHE_TTL : CACHE_TTL
+      await cachePut(sourceCacheKey, JSON.stringify(result), ttl)
+      console.log(`[Stream API] Cached per-source: ${sourceCacheKey} (ttl: ${ttl}s)`)
     }
 
     return NextResponse.json(result, {
@@ -1566,7 +1602,7 @@ async function _GET(request: NextRequest) {
 
   const season = searchParams.get('season') || '1'
   const episode = searchParams.get('episode') || '1'
-  const cacheKey = `cmb:${type}:${id}:${season}:${episode}`
+  const cacheKey = `v2:cmb:${type}:${id}:${season}:${episode}`
 
   // Check cache: Cache API → memory → Fetch (unless nocache=1)
   if (!nocache) {
@@ -1574,12 +1610,18 @@ async function _GET(request: NextRequest) {
     if (cached) {
       const cachedData = JSON.parse(cached.data) as StreamData
       if (cachedData.sources && cachedData.sources.length > 0) {
-        console.log(`[Stream API] Combined ${cached.layer} HIT: ${cacheKey} (age: ${cached.age}s)`)
-        // Stale-while-revalidate: if >2 days old, refresh in background (still serve cached)
-        if (cached.age > CACHE_TTL) {
+        const tokenized = sourcesHaveTokens(cachedData.sources)
+        const effectiveTtl = tokenized ? TOKEN_CACHE_TTL : CACHE_TTL
+        console.log(`[Stream API] Combined ${cached.layer} HIT: ${cacheKey} (age: ${cached.age}s, ttl: ${effectiveTtl}s)`)
+        if (cached.age > effectiveTtl && !tokenized) {
+          // Stale-while-revalidate (non-token only — token entries are skipped
+          // below: stale signed URLs must not be served)
           refreshCombinedInBackground(type, id, season, episode, cacheKey)
         }
-        return buildCachedResponse(cachedData, `HIT-${cached.layer}`, cached.age.toString())
+        if (!tokenized || cached.age <= effectiveTtl) {
+          return buildCachedResponse(cachedData, `HIT-${cached.layer}`, cached.age.toString())
+        }
+        console.log(`[Stream API] Combined token entry stale — re-fetching fresh: ${cacheKey}`)
       }
     }
   }
@@ -1666,9 +1708,10 @@ async function _GET(request: NextRequest) {
     subtitles: dedupedSubs,
   }
 
-  // Save to Cache API (unlimited, free!)
-  await cachePut(cacheKey, JSON.stringify(mergedData))
-  console.log(`[Stream API] Cached combined: ${cacheKey} (${allSources.length} sources)`)
+  // Save to Cache API (unlimited, free!) — token-bearing sources get a short TTL
+  const combinedTtl = sourcesHaveTokens(allSources) ? TOKEN_CACHE_TTL : CACHE_TTL
+  await cachePut(cacheKey, JSON.stringify(mergedData), combinedTtl)
+  console.log(`[Stream API] Cached combined: ${cacheKey} (${allSources.length} sources, ttl: ${combinedTtl}s)`)
 
   return buildCachedResponse(mergedData, nocache ? 'NOCACHE' : 'MISS', '0')
 } // end _GET
