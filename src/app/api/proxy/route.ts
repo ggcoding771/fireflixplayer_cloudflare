@@ -194,6 +194,20 @@ export async function GET(request: NextRequest) {
     if (isPlaylist) {
       const body = await response.text();
 
+      // GARBAGE GUARD: upstreams (and the HF /proxy_range relay) answer a
+      // playlist URL with an HTML error page when their origin is down — and
+      // wrap every line of it as proxy URLs, serving 200 + mpegurl. hls.js
+      // then "parses" the error page forever = the infinite-spinner bug.
+      // Anything without the #EXTM3U signature is NOT a playlist: fail with
+      // 502 so the player blames the server immediately and moves on.
+      if (!body.includes('#EXTM3U')) {
+        console.warn(`[Proxy] Playlist URL returned non-m3u8 body (${body.slice(0, 80).replace(/\s+/g, ' ')}…) — returning 502`);
+        return new NextResponse(null, {
+          status: 502,
+          headers: { 'Access-Control-Allow-Origin': '*' },
+        });
+      }
+
       // Cache MASTER playlists for 2 days — detected by #EXT-X-STREAM-INF.
       // NEVER cache media playlists (segment lists): castle-family streams are
       // live sliding-window playlists — a 2-day-cached segment list would stall

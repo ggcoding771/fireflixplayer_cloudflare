@@ -84,9 +84,13 @@ export const SOURCES: SourceConfig[] = [
     apiSourceKey: 'netmirror',
     languageFlags: '🌍',
     languages: ['en', 'hi', 'ta', 'te', 'es', 'fr', 'de', 'ja', 'ko', 'ar', 'ru', 'th', 'vi', 'id', 'it', 'pt', 'pl', 'tr', 'uk', 'multi'],
-    order: 1,
-    reliability: 'high',
-    note: 'net27.cc embed-tmdb. Some older titles genuinely missing from NetMirror (e.g. Venom 2018) — pick another server then',
+    // Auto-play order demoted from 1 → 7.5: with the CDN egress-blocked the
+    // fail-fast probe costs ~15s on every title when tried first; Pluto (2)
+    // starts instantly. Still fully listed & manually selectable — the moment
+    // net27 restores HLS (or the CDN unblocks CF egress), promote it back.
+    order: 7.5,
+    reliability: 'medium',
+    note: 'net27.cc switched upstreams: old 30+ language HLS is dead (their /api/loffe fallback is broken server-side); now serves multi-audio MP4s from bcdnxw.hakunaymatata.com which 426/427-blocks HF+CF proxy egress (verified Sep 2026). Fail-fast probe marks it failed until their CDN unblocks or HLS returns. Some older titles genuinely missing (e.g. Venom 2018)',
   },
   // === 2. Pluto (Castle) — multi-language ===
   {
@@ -167,6 +171,7 @@ export const SOURCES: SourceConfig[] = [
     languages: ['hi', 'en', 'multi'],
     order: 8,
     reliability: 'medium',
+    note: 'm4uplay/acek-cdn: tokens are ASN-stamped by m4uplay.store (AWS 14618 = the StreamForge Space) and served via the Space proxy — works when the acek origin is healthy (4 languages: hi/ta/te/en), 500/502 when their origin is down (title-specific); fail-fast detects it',
   },
   // === 9. Lyra (PersianStremio) — direct MKV up to 4K ===
   {

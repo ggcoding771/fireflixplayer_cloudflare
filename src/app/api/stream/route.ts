@@ -558,7 +558,7 @@ async function fetchMissouriMonster(
 async function probeDirectFile(
   url: string,
   headers?: Record<string, string>
-): Promise<boolean> {
+): Promise<{ live: boolean; status: number | null }> {
   try {
     const probeHeaders: Record<string, string> = {
       'User-Agent': headers?.['User-Agent'] || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
@@ -570,30 +570,43 @@ async function probeDirectFile(
 
     const res = await fetch(url, {
       headers: probeHeaders,
-      signal: AbortSignal.timeout(8000),
+      signal: AbortSignal.timeout(6000),
     });
-    if (res.status !== 200 && res.status !== 206) return false;
+    // Cancel the body WITHOUT reading it — some CDNs ignore Range and answer
+    // 200 with the whole multi-GB file; res.arrayBuffer() would buffer it all
+    // and blow the Worker's 128MB memory limit.
+    try { await res.body?.cancel(); } catch { /* already closed */ }
+    if (res.status !== 200 && res.status !== 206) {
+      return { live: false, status: res.status };
+    }
     const ctype = (res.headers.get('content-type') || '').toLowerCase();
-    if (ctype.includes('text/html') || ctype.includes('application/json')) return false;
-    // consume the 2 bytes so the connection is released
-    await res.arrayBuffer();
-    return true;
+    if (ctype.includes('text/html') || ctype.includes('application/json')) {
+      return { live: false, status: res.status };
+    }
+    return { live: true, status: res.status };
   } catch {
-    return false;
+    return { live: false, status: null };
   }
 }
 
-// Probe candidates in order, return the first URL that responds with a
-// live media file. Caps at 4 candidates × 8s to stay inside the route budget.
-async function probeFirstLive(
+// Probe candidates IN PARALLEL (sequential probing burns 4 × 8s when they're
+// all dead — the user stares at a spinner for half a minute). Each probe is a
+// 2-byte Range request, so firing them together is cheap. Returns the first
+// LIVE url in the candidates' original order plus the failures' status codes
+// so the caller can surface an honest "CDN blocked this (HTTP 427)" error.
+async function probeDirectCandidates(
   candidates: Array<{ url: string; headers?: Record<string, string> }>
-): Promise<string | null> {
-  for (const c of candidates.slice(0, 4)) {
-    if (await probeDirectFile(c.url, c.headers)) {
-      return c.url;
+): Promise<{ liveUrl: string | null; deadStatuses: Array<number | null> }> {
+  const slice = candidates.slice(0, 4);
+  const results = await Promise.all(
+    slice.map(c => probeDirectFile(c.url, c.headers))
+  );
+  for (let i = 0; i < slice.length; i++) {
+    if (results[i].live) {
+      return { liveUrl: slice[i].url, deadStatuses: results.filter(r => !r.live).map(r => r.status) };
     }
   }
-  return null;
+  return { liveUrl: null, deadStatuses: results.map(r => r.status) };
 }
 
 async function fetchStreamForge(
@@ -648,16 +661,20 @@ async function fetchStreamForge(
         }
       }
 
-      // ── Direct-file candidates: probe the first few and promote the first
-      // LIVE one to primary (fsonic's first result is often a dead file).
+      // ── Direct-file candidates: probe them (in parallel) and promote the
+      // first LIVE one to primary (fsonic's first result is often a dead file).
       // proxy_range-wrapped URLs are skipped — probing burns their token.
+      // ALL-DEAD = fail this source NOW with the real HTTP status instead of
+      // handing the player a URL that can only spin forever (Moon's CDN
+      // 427-blocks every proxy egress we own — the user sees "failed" in
+      // ~10s and the auto-chain moves on to the next server).
       const directCandidates = filteredResults.filter(
         (r: { type?: string; url?: string }) =>
           (r.type === 'direct' || r.type === 'mp4') &&
           !(r.url || '').includes('/proxy_range')
       );
-      if (directCandidates.length > 1) {
-        const liveUrl = await probeFirstLive(
+      if (directCandidates.length >= 1) {
+        const { liveUrl, deadStatuses } = await probeDirectCandidates(
           directCandidates.map((r: { url: string; headers?: Record<string, string> }) => ({ url: r.url, headers: r.headers }))
         );
         if (liveUrl) {
@@ -667,6 +684,30 @@ async function fetchStreamForge(
             const [winner] = filteredResults.splice(idx, 1);
             filteredResults.unshift(winner);
           }
+        } else {
+          // Every direct file refused the probe — playback from CF Workers
+          // egress is impossible, so this source is dead *right now*.
+          // (Statuses: 404/410 = dead file, 426/427 = CDN blocks our egress,
+          // null = timeout/unreachable.) NOT cached — a later click re-probes.
+          const blocked = deadStatuses.find(s => s === 426 || s === 427);
+          const statusHint = blocked
+            ? `CDN blocks our proxy (HTTP ${blocked})`
+            : deadStatuses.find(s => s && s >= 400)
+              ? `files unavailable (HTTP ${deadStatuses.find(s => s && s >= 400)})`
+              : 'files unreachable';
+          return {
+            sourceId: `sf-${sourceKey}`,
+            sourceName: sourceKey,
+            success: false,
+            url: null,
+            rawUrl: null,
+            audioTracks: [],
+            qualities: [],
+            languageFlags: '',
+            elapsedMs,
+            error: statusHint,
+            needsProxy: true,
+          };
         }
       }
 
@@ -683,7 +724,10 @@ async function fetchStreamForge(
         const detectedLang = detectLanguageFromUrl(r.url || '', r.title);
         return lang === 'english' || urlStr.includes('_eng_') || urlStr.includes('_eng.') || detectedLang === 'English';
       });
-      const primary = multiStream || englishStream || filteredResults[0];
+      const m3u8Preferred = filteredResults.find(
+        (r: { type?: string }) => (r.type || 'm3u8') === 'm3u8'
+      );
+      const primary = multiStream || englishStream || m3u8Preferred || filteredResults[0];
 
       // ── Castle-family (castle + meowtv): their m3u8 auth_keys are minted for
       // the StreamForge Space's OWN egress IP — every other IP (CF Workers,
@@ -726,9 +770,17 @@ async function fetchStreamForge(
           m3u8Headers: Record<string, string>;
         }>();
 
-        const parsePromises = filteredResults.map(async (
-          r: { title?: string; url?: string; language?: string; quality?: string; type?: string; headers?: Record<string, string> }
-        ) => {
+        // NetMirror switched upstreams: results are now direct MP4s
+        // (bcdnxw 'tran-audio' files), not m3u8s. NEVER .text() a direct
+        // media file — a 2GB MP4 would buffer until the Worker OOMs. Only
+        // m3u8-type results are parsed for combined audio tracks (if
+        // net27.cc ever restores their HLS, the language-merging comes
+        // back to life automatically).
+        const parsePromises = filteredResults
+          .filter((r: { type?: string }) => r.type !== 'direct' && r.type !== 'mp4')
+          .map(async (
+            r: { title?: string; url?: string; language?: string; quality?: string; type?: string; headers?: Record<string, string> }
+          ) => {
           const resultUrl = r.url || '';
           const resultHeaders: Record<string, string> = {};
           if (r.headers) Object.assign(resultHeaders, r.headers);
@@ -799,6 +851,13 @@ async function fetchStreamForge(
         // validates the exact playback chain end-to-end.
         // NEVER do this for direct files — .text() on a 2GB MKV/MP4 would try
         // to buffer the whole movie.
+        // FAIL-FAST: a definitive dead master (non-200, or a 200 whose body is
+        // an HTML error page instead of #EXTM3U — the /api/proxy garbage guard
+        // converts that to 502) means the player can NEVER start on this URL.
+        // Report the source as failed NOW with the real reason, so the
+        // auto-chain picks the next server instead of spinning forever
+        // (Comet/acek-cdn serves exactly this when their origin is down).
+        // Timeouts/network throws are NOT definitive — keep the stream.
         const isDirectPrimary = primary.type === 'direct' || primary.type === 'mp4';
         if (!isDirectPrimary) {
           try {
@@ -821,10 +880,41 @@ async function fetchStreamForge(
                 const parsed = parseM3U8(m3u8Content, primaryUrl);
                 audioTracks = parsed.audioTracks;
                 qualities = parsed.qualities;
+              } else {
+                // 200 but not a playlist — upstream served an error page.
+                return {
+                  sourceId: `sf-${sourceKey}`,
+                  sourceName: sourceKey,
+                  success: false,
+                  url: null,
+                  rawUrl: null,
+                  audioTracks: [],
+                  qualities: [],
+                  languageFlags: '',
+                  elapsedMs,
+                  error: 'Stream CDN returned an error page (upstream down)',
+                  needsProxy: true,
+                };
               }
+            } else {
+              // Definitive upstream error (403/500/502…) — relay the status.
+              return {
+                sourceId: `sf-${sourceKey}`,
+                sourceName: sourceKey,
+                success: false,
+                url: null,
+                rawUrl: null,
+                audioTracks: [],
+                qualities: [],
+                languageFlags: '',
+                elapsedMs,
+                error: `Stream CDN error (HTTP ${m3u8Response.status})`,
+                needsProxy: true,
+              };
             }
           } catch {
-            // m3u8 fetch failed, continue without track info
+            // m3u8 fetch timed out / network error — NOT definitive. Continue;
+            // playback may still work (hls.js retries fresh).
           }
         }
 
@@ -1540,9 +1630,11 @@ async function _GET(request: NextRequest) {
       )
     }
 
-    // v2: cache key versioned — bumps orphan every entry from before the
-    // proxied_url fix (those hold dead castle auth_keys)
-    const sourceCacheKey = `v2:src:${sourceId}:${type}:${tmdbIdParam}:${season}:${episode}`
+    // v3: cache key versioned — bumps every entry from before the
+    // fail-fast/probe fixes (those hold "success" results for streams that
+    // can never start — Moon's CDN-blocked MP4s, Comet's dead-origin masters,
+    // and pre-proxied_url castle auth_keys from the v1/v2 era)
+    const sourceCacheKey = `v3:src:${sourceId}:${type}:${tmdbIdParam}:${season}:${episode}`
 
     // Check cache: Cache API → memory → Fetch (unless nocache=1)
     if (!nocache) {
@@ -1602,7 +1694,7 @@ async function _GET(request: NextRequest) {
 
   const season = searchParams.get('season') || '1'
   const episode = searchParams.get('episode') || '1'
-  const cacheKey = `v2:cmb:${type}:${id}:${season}:${episode}`
+  const cacheKey = `v3:cmb:${type}:${id}:${season}:${episode}`
 
   // Check cache: Cache API → memory → Fetch (unless nocache=1)
   if (!nocache) {

@@ -398,6 +398,12 @@ export function EmbedPlayer({ tmdbId, type, season, episode }: EmbedPlayerProps)
         const activeSourceName = activeSourceId
           ? sources.find(s => s.id === activeSourceId)?.name
           : null;
+        // The stream API's real reason (e.g. "CDN blocks our proxy (HTTP
+        // 427)" for Moon, "Stream CDN error (HTTP 502)" for Comet's dead
+        // origin) — shown instead of a generic shrug so the user knows WHY.
+        const activeError = activeSourceId
+          ? sourceStatuses[activeSourceId]?.error
+          : null;
         const hasSources = sources.length > 0;
         // "No servers available" is ONLY true when every single server
         // failed its own check (or none were loaded). One failing server
@@ -460,6 +466,9 @@ export function EmbedPlayer({ tmdbId, type, season, episode }: EmbedPlayerProps)
               <p className="text-sm font-medium text-zinc-200">
                 {activeSourceName ? `${activeSourceName} isn't responding` : 'That server failed'}
               </p>
+              {activeError && (
+                <p className="text-xs text-zinc-400 max-w-70 text-center">{activeError}</p>
+              )}
               <p className="text-xs text-zinc-500">Pick another server from the list (top-right)</p>
               {activeSourceId && (
                 <button
