@@ -443,6 +443,23 @@ export function ArtPlayerWrapper({
         lowLatencyMode: false,
         startFragPrefetch: true,
         enableSubtitles: true,
+        // ── Slow-origin tolerance ──────────────────────────────────────────
+        // The Space-proxy chain serves some CDNs' segments at ~400-500KB/s
+        // PER CONNECTION (acek-cdn throttles via the token's sp=500 param).
+        // A 5MB video segment then takes 11-13s — hls.js's DEFAULT 20s
+        // fragLoadingTimeOut is one congested fetch away from declaring a
+        // fatal fragLoadTimeout, which after retries surfaces as
+        // "X isn't responding" even though the stream was playing fine.
+        // Give the loader enough rope: 45s per attempt + 8 retries, and
+        // longer level/manifest budgets for cold-cache playlist loads.
+        fragLoadingTimeOut: 45000,
+        fragLoadingMaxRetry: 8,
+        fragLoadingRetryDelay: 1000,
+        fragLoadingMaxRetryTimeout: 64000,
+        levelLoadingTimeOut: 30000,
+        levelLoadingMaxRetry: 6,
+        manifestLoadingTimeOut: 30000,
+        manifestLoadingMaxRetry: 4,
       });
       hlsRef.current = hls;
 
@@ -787,7 +804,7 @@ export function ArtPlayerWrapper({
       // Don't reject the source just because of a brief network blip.
       // Only give up if we can't recover after many attempts.
       let recoveryAttempts = 0;
-      const MAX_NETWORK_RECOVERY = 5;  // Allow many retries for network errors
+      const MAX_NETWORK_RECOVERY = 7;  // Slow-CDN windows can last minutes; each startLoad() re-arms hls.js's own retry cycle
       const MAX_MEDIA_RECOVERY = 3;    // Media errors are usually more serious
 
       hls.on(Hls.Events.ERROR, (_event, data) => {

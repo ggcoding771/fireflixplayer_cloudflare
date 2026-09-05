@@ -559,12 +559,30 @@ async function rewriteM3U8(content: string, baseUrl: string, searchParams: URLSe
 
   // Route an inner-upstream URL back through the SAME Space (asn-stamped
   // tokens validate only from the Space's egress) and then the local proxy.
+  // SEGMENT lines get &boost=1: the Space fetches big segments as parallel
+  // Range requests (acek-cdn per-connection throttles ~450KB/s — the 4-way
+  // split gives ~4x aggregate). Playlists/subtitles are exempt; the Space
+  // itself ignores boost for anything <1MB or when the client sent a Range.
   const wrapSpaceInner = (absInner: string): string => {
     const p = new URLSearchParams({ u: absInner });
     if (spaceProxy!.ref) p.set('ref', spaceProxy!.ref);
     if (spaceProxy!.ua) p.set('ua', spaceProxy!.ua);
-    const spaceRange = `${spaceProxy!.spaceOrigin}/proxy_range?${p.toString()}`;
+    let spaceRange = `${spaceProxy!.spaceOrigin}/proxy_range?${p.toString()}`;
+    if (!isM3U8Url(absInner) && !isSubtitleSegment(absInner)) {
+      spaceRange += '&boost=1';
+    }
     return buildLocalProxyUrl(localProxyBase, spaceRange, referer, origin, ua);
+  };
+
+  // Space-served absolute URL (Comet/acek, castle, vidrock…): if it points
+  // at a SEGMENT (inner URL is not a playlist/subtitle), ask the Space for
+  // the parallel-range booster. Unknown params are ignored by Spaces that
+  // don't implement it — strictly opt-in and harmless.
+  const maybeBoostSpaceUrl = (url: string): string => {
+    const sp = parseSpaceProxyUrl(url);
+    if (!sp) return url;
+    if (isM3U8Url(sp.inner) || isSubtitleSegment(sp.inner)) return url;
+    return url.includes('boost=') ? url : `${url}&boost=1`;
   };
 
   // Detect Castle/freecdn/VidApi URLs
@@ -638,18 +656,22 @@ async function rewriteM3U8(content: string, baseUrl: string, searchParams: URLSe
       return buildHFProxyUrl(resolved, referer, origin);
     }
 
+    // Space-served segment (already-absolute Space URL from the Space's own
+    // rewrite): engage the parallel-range booster before wrapping.
+    const resolvedFinal = maybeBoostSpaceUrl(resolved);
+
     // Sub-playlists → local proxy
     if (isM3U8Url(resolved)) {
-      return buildLocalProxyUrl(localProxyBase, resolved, referer, origin, ua);
+      return buildLocalProxyUrl(localProxyBase, resolvedFinal, referer, origin, ua);
     }
 
     // Subtitle segments → local proxy
     if (isSubtitleSegment(resolved)) {
-      return buildLocalProxyUrl(localProxyBase, resolved, referer, origin, ua);
+      return buildLocalProxyUrl(localProxyBase, resolvedFinal, referer, origin, ua);
     }
 
     // Other segments → local proxy
-    return buildLocalProxyUrl(localProxyBase, resolved, referer, origin, ua);
+    return buildLocalProxyUrl(localProxyBase, resolvedFinal, referer, origin, ua);
   }).join('\n');
 }
 
