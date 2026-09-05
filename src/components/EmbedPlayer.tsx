@@ -84,20 +84,10 @@ export function EmbedPlayer({ tmdbId, type, season, episode }: EmbedPlayerProps)
   }, [sources]);
 
   const updateSourceStatus = useCallback((sourceId: string, update: Partial<SourceStatus>) => {
-    setSourceStatuses(prev => {
-      const next = {
-        ...prev,
-        [sourceId]: { ...prev[sourceId], sourceId, ...update },
-      };
-      // Write the ref IMMEDIATELY (not after re-render): tryAutoPlay calls
-      // playSource right after fetchSource resolves, and playSource reads
-      // streamType from this ref. With the deferred useEffect sync the ref
-      // was still empty on first auto-play → playbackType fell back to
-      // 'auto' → hls.js tried to parse a direct MKV/MP4 as a manifest
-      // (manifestParsingError) and the source got wrongly marked failed.
-      sourceStatusesRef.current = next;
-      return next;
-    });
+    setSourceStatuses(prev => ({
+      ...prev,
+      [sourceId]: { ...prev[sourceId], sourceId, ...update },
+    }));
   }, []);
 
   const fetchSource = useCallback(async (sourceId: string): Promise<SourceStatus> => {
@@ -133,6 +123,13 @@ export function EmbedPlayer({ tmdbId, type, season, episode }: EmbedPlayerProps)
       };
 
       updateSourceStatus(sourceId, status);
+      // playSource (called immediately after this resolves by tryAutoPlay)
+      // reads streamType from sourceStatusesRef — the state updater + the
+      // useEffect ref-sync both run at NEXT RENDER, too late for the first
+      // auto-play: playbackType fell back to 'auto' and hls.js tried to
+      // parse the direct MKV/MP4 as a manifest (manifestParsingError).
+      // Write the fresh status into the ref SYNCHRONOUSLY.
+      sourceStatusesRef.current = { ...sourceStatusesRef.current, [sourceId]: status };
       return status;
     } catch (err) {
       const status: SourceStatus = {
@@ -144,18 +141,20 @@ export function EmbedPlayer({ tmdbId, type, season, episode }: EmbedPlayerProps)
         error: err instanceof Error ? err.message : 'Fetch failed',
       };
       updateSourceStatus(sourceId, status);
+      sourceStatusesRef.current = { ...sourceStatusesRef.current, [sourceId]: status };
       return status;
     }
   }, [tmdbId, type, season, episode, updateSourceStatus]);
 
-  const playSource = useCallback((sourceId: string, overrideUrl?: string) => {
+  const playSource = useCallback((sourceId: string, overrideUrl?: string, overrideType?: 'direct' | 'm3u8') => {
     const status = sourceStatusesRef.current[sourceId];
     const url = overrideUrl || status?.streamUrl;
     if (!url) return;
 
+    const streamType = overrideType || status?.streamType;
     setActiveSourceId(sourceId);
     setActiveStreamUrl(url);
-    setActivePlaybackType(status?.streamType === 'direct' ? 'native' : 'auto');
+    setActivePlaybackType(streamType === 'direct' ? 'native' : 'auto');
     setActiveHeaders(status?.headers);
     setDesiredAudioLanguage(undefined);
     setLoading(false);
@@ -191,7 +190,7 @@ export function EmbedPlayer({ tmdbId, type, season, episode }: EmbedPlayerProps)
       }
 
       if (status && status.status === 'success' && status.streamUrl) {
-        playSource(source.id, status.streamUrl);
+        playSource(source.id, status.streamUrl, status.streamType);
 
         // If this source has multiStreams, auto-open the dropdown so user can pick a language
         if (status.multiStreams && status.multiStreams.length > 1) {
