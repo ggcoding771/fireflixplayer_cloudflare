@@ -84,10 +84,20 @@ export function EmbedPlayer({ tmdbId, type, season, episode }: EmbedPlayerProps)
   }, [sources]);
 
   const updateSourceStatus = useCallback((sourceId: string, update: Partial<SourceStatus>) => {
-    setSourceStatuses(prev => ({
-      ...prev,
-      [sourceId]: { ...prev[sourceId], sourceId, ...update },
-    }));
+    setSourceStatuses(prev => {
+      const next = {
+        ...prev,
+        [sourceId]: { ...prev[sourceId], sourceId, ...update },
+      };
+      // Write the ref IMMEDIATELY (not after re-render): tryAutoPlay calls
+      // playSource right after fetchSource resolves, and playSource reads
+      // streamType from this ref. With the deferred useEffect sync the ref
+      // was still empty on first auto-play → playbackType fell back to
+      // 'auto' → hls.js tried to parse a direct MKV/MP4 as a manifest
+      // (manifestParsingError) and the source got wrongly marked failed.
+      sourceStatusesRef.current = next;
+      return next;
+    });
   }, []);
 
   const fetchSource = useCallback(async (sourceId: string): Promise<SourceStatus> => {
