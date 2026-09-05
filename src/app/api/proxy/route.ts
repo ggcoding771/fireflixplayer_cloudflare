@@ -152,6 +152,30 @@ export async function GET(request: NextRequest) {
         if (cached.age > maxAge) {
           refreshProxyInBackground(targetUrl, referer, origin, isMasterM3U8);
         }
+        // Masters are cached RAW — re-run the rewrite on every hit so the
+        // served playlist is identical to the MISS path. Without this, a
+        // cache-hit master keeps its relative #EXT-X-MEDIA URIs, which hls.js
+        // resolves against /api/proxy (→ pages.dev/index-a1.m3u8 → 404 →
+        // audioTrackLoadError loop on every multi-audio server).
+        if (isMasterM3U8) {
+          try {
+            const rawBody = await cached.response.text();
+            if (rawBody.includes('#EXTM3U')) {
+              const rewritten = await rewriteM3U8(rawBody, targetUrl, searchParams);
+              return new Response(rewritten, {
+                status: 200,
+                headers: {
+                  'Content-Type': 'application/vnd.apple.mpegurl',
+                  'Access-Control-Allow-Origin': '*',
+                  'Cache-Control': 'no-cache',
+                  'X-Cache': 'HIT',
+                },
+              });
+            }
+          } catch {
+            // fall through to re-fetch below
+          }
+        }
         const respHeaders = new Headers(cached.response.headers);
         respHeaders.delete('X-Cache-Timestamp');
         respHeaders.set('X-Cache', 'HIT');
@@ -383,12 +407,59 @@ function isSubtitleSegment(url: string): boolean {
   return false;
 }
 
+/**
+ * If `url` is an HF Space /proxy_range (or /proxy) wrapper, extract the Space
+ * origin, the inner upstream URL and its ref/ua params.
+ *
+ * WHY: masters served through a Space proxy keep #EXT-X-MEDIA URI attributes
+ * (audio tracks!) RELATIVE — the Space only rewrites plain variant/segment
+ * lines to absolute /proxy_range URLs. Resolving a relative URI against the
+ * PROXY url produces https://<space>/index-a1.m3u8 → 404 → hls.js
+ * audioTrackLoadError retry loop → the video never starts even though the
+ * master and languages are perfectly healthy (Comet's exact symptom). The
+ * correct base is the INNER upstream URL, and the resolved URL must flow
+ * back through the SAME Space so asn-stamped tokens (acek-cdn's asn=14618)
+ * keep matching the Space's egress.
+ */
+function parseSpaceProxyUrl(url: string): { spaceOrigin: string; inner: string; ref: string; ua: string } | null {
+  try {
+    const u = new URL(url);
+    if (!u.hostname.endsWith('.hf.space')) return null;
+    if (u.pathname !== '/proxy_range' && u.pathname !== '/proxy') return null;
+    const inner = u.searchParams.get('u') || u.searchParams.get('url');
+    if (!inner || !/^https?:\/\//i.test(inner)) return null;
+    return {
+      spaceOrigin: u.origin,
+      inner,
+      ref: u.searchParams.get('ref') || '',
+      ua: u.searchParams.get('ua') || '',
+    };
+  } catch {
+    return null;
+  }
+}
+
 async function rewriteM3U8(content: string, baseUrl: string, searchParams: URLSearchParams): Promise<string> {
   const lines = content.split('\n');
   const referer = searchParams.get('referer') || '';
   const origin = searchParams.get('origin') || '';
   const ua = searchParams.get('ua') || '';
   const localProxyBase = '/api/proxy';
+
+  const spaceProxy = parseSpaceProxyUrl(baseUrl);
+  if (spaceProxy) {
+    console.log(`[Proxy] Space-proxied playlist — relative refs resolve against inner URL (${spaceProxy.inner.slice(0, 80)})`);
+  }
+
+  // Route an inner-upstream URL back through the SAME Space (asn-stamped
+  // tokens validate only from the Space's egress) and then the local proxy.
+  const wrapSpaceInner = (absInner: string): string => {
+    const p = new URLSearchParams({ u: absInner });
+    if (spaceProxy!.ref) p.set('ref', spaceProxy!.ref);
+    if (spaceProxy!.ua) p.set('ua', spaceProxy!.ua);
+    const spaceRange = `${spaceProxy!.spaceOrigin}/proxy_range?${p.toString()}`;
+    return buildLocalProxyUrl(localProxyBase, spaceRange, referer, origin, ua);
+  };
 
   // Detect Castle/freecdn/VidApi URLs
   let hasCastleUrls = false;
@@ -398,7 +469,9 @@ async function rewriteM3U8(content: string, baseUrl: string, searchParams: URLSe
     const trimmed = line.trim();
     if (trimmed === '' || trimmed.startsWith('#')) continue;
 
-    const resolved = resolveUrl(trimmed, baseUrl);
+    const resolved = spaceProxy && !/^https?:\/\//i.test(trimmed)
+      ? resolveUrl(trimmed, spaceProxy.inner)
+      : resolveUrl(trimmed, baseUrl);
     if (isFreecdnCDN(resolved)) hasFreecdnUrls = true;
     if (isCastleCDN(resolved)) hasCastleUrls = true;
     if (isVidApiCDN(resolved)) hasVidApiUrls = true;
@@ -406,7 +479,9 @@ async function rewriteM3U8(content: string, baseUrl: string, searchParams: URLSe
     if (trimmed.includes('URI="')) {
       const uriMatch = trimmed.match(/URI="([^"]+)"/);
       if (uriMatch) {
-        const uriResolved = resolveUrl(uriMatch[1], baseUrl);
+        const uriResolved = spaceProxy && !/^https?:\/\//i.test(uriMatch[1])
+          ? resolveUrl(uriMatch[1], spaceProxy.inner)
+          : resolveUrl(uriMatch[1], baseUrl);
         if (isFreecdnCDN(uriResolved)) hasFreecdnUrls = true;
         if (isCastleCDN(uriResolved)) hasCastleUrls = true;
         if (isVidApiCDN(uriResolved)) hasVidApiUrls = true;
@@ -425,6 +500,12 @@ async function rewriteM3U8(content: string, baseUrl: string, searchParams: URLSe
     if (trimmed.startsWith('#')) {
       if (trimmed.includes('URI="')) {
         return trimmed.replace(/URI="([^"]+)"/g, (_match, uri: string) => {
+          // Relative URI inside a Space-proxied master (audio track!) —
+          // resolve against the INNER url, route via the same Space.
+          if (spaceProxy && !/^https?:\/\//i.test(uri)) {
+            return `URI="${wrapSpaceInner(resolveUrl(uri, spaceProxy.inner))}"`;
+          }
+
           const resolved = resolveUrl(uri, baseUrl);
 
           if (isFreecdnCDN(resolved) || isCastleCDN(resolved) || isVidApiCDN(resolved)) {
@@ -435,6 +516,13 @@ async function rewriteM3U8(content: string, baseUrl: string, searchParams: URLSe
         });
       }
       return line;
+    }
+
+    // Relative variant/segment line inside a Space-proxied playlist — same
+    // inner-URL treatment (defensive: the Space rewrites plain lines today,
+    // but a raw playlist from it would resolve against the wrong base too).
+    if (spaceProxy && !/^https?:\/\//i.test(trimmed)) {
+      return wrapSpaceInner(resolveUrl(trimmed, spaceProxy.inner));
     }
 
     const resolved = resolveUrl(trimmed, baseUrl);
