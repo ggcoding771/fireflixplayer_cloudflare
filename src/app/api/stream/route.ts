@@ -703,6 +703,26 @@ async function fetchStreamForge(
         }
       }
 
+      // ── Aries (vegamovies): rank direct candidates by URL quality BEFORE
+      // the liveness probe so the promoted primary is the best file, not just
+      // the first live one. Named/signed .mkv URLs (r2.cloudflarestorage with
+      // response-content-disposition) beat content-hash r2.dev URLs (which
+      // need the proxy's magic-byte sniff) beat pixeldrain (rate-limited, and
+      // historically the same file for different shows).
+      if (sourceKey === 'vegamovies') {
+        const vegaRank = (u: string): number => {
+          const low = (u || '').toLowerCase();
+          if (low.includes('.mkv') || low.includes('.mp4')) return 0;
+          if (low.includes('cloudflarestorage') || low.includes('response-content-disposition')) return 1;
+          if (low.includes('pixeldrain')) return 3;
+          if (low.includes('.r2.dev')) return 2;
+          return 2;
+        };
+        filteredResults = [...filteredResults].sort(
+          (a: { url?: string }, b: { url?: string }) => vegaRank(a.url || '') - vegaRank(b.url || '')
+        );
+      }
+
       // ── Browser-direct policy (movix): free.finepulfe.xyz 403-challenges
       // every datacenter egress (CF Workers, HF) but serves real browsers and
       // sends Access-Control-Allow-Origin: *. The m3u8 is handed to the

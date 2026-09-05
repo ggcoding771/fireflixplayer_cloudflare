@@ -325,6 +325,66 @@ export async function GET(request: NextRequest) {
         responseContentType = 'video/mp4';
       }
 
+      // ── Magic-byte sniff for extensionless files ──────────────────────
+      // VegaMovies' r2.dev results are CONTENT-HASH URLs (no .mkv/.mp4 ext)
+      // serving octet-stream. The octet-stream fallback above guesses
+      // video/mp4 — but the file can be a Matroska! Chrome picks its demuxer
+      // from Content-Type (no sniffing for media), so an MKV labeled video/mp4
+      // errors out instantly and the source gets blamed. Tee the stream, read
+      // the first chunk, detect EBML (Matroska/WebM) vs 'ftyp' (MP4), then
+      // replay the chunk in front of the rest.
+      const urlLower = targetUrl.toLowerCase();
+      const hasVideoExt = ['.mp4', '.mkv', '.webm', '.m4s', '.ts', '.mov'].some(ext => urlLower.includes(ext));
+      const upstreamVideoType = (contentType || '').startsWith('video/');
+      const typeWasGuessed = !hasVideoExt && !upstreamVideoType;
+      let outBody: ReadableStream<Uint8Array> | null = response.body
+        ? (response.body as ReadableStream<Uint8Array>)
+        : null;
+      if (response.body && typeWasGuessed) {
+        try {
+          const [probeBranch, restBranch] = (response.body as ReadableStream<Uint8Array>).tee();
+          const probeReader = probeBranch.getReader();
+          const { value: firstChunk } = await probeReader.read();
+          try { await probeBranch.cancel(); } catch { /* already closed */ }
+          if (firstChunk && firstChunk.length >= 12) {
+            const isEBML =
+              firstChunk[0] === 0x1a && firstChunk[1] === 0x45 &&
+              firstChunk[2] === 0xdf && firstChunk[3] === 0xa3;
+            const isFtyp =
+              firstChunk[4] === 0x66 && firstChunk[5] === 0x74 &&
+              firstChunk[6] === 0x79 && firstChunk[7] === 0x70;
+            if (isEBML) {
+              responseContentType = 'video/x-matroska';
+              console.log('[Proxy] Sniffed Matroska magic on extensionless file → video/x-matroska');
+            } else if (isFtyp && responseContentType !== 'video/mp4') {
+              responseContentType = 'video/mp4';
+              console.log('[Proxy] Sniffed MP4 ftyp on extensionless file → video/mp4');
+            }
+            // Replay: the first chunk back in front of the remaining stream.
+            const head = firstChunk;
+            outBody = new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.enqueue(head);
+                const rd = restBranch.getReader();
+                const pump = (): void => {
+                  rd.read().then(({ done, value }) => {
+                    if (done) { try { controller.close(); } catch { /* closed */ } return; }
+                    controller.enqueue(value);
+                    pump();
+                  }).catch(() => { try { controller.close(); } catch { /* closed */ } });
+                };
+                pump();
+              },
+            });
+          } else {
+            outBody = restBranch;
+          }
+        } catch {
+          // tee/read failed — stream the original body untouched
+          outBody = response.body ? (response.body as ReadableStream<Uint8Array>) : null;
+        }
+      }
+
       // Cache .ts/.m4s segments for 6 hours (these rarely change)
       if (isSegment) {
         // For segments, we need to cache the raw binary — do it in the background
@@ -355,8 +415,8 @@ export async function GET(request: NextRequest) {
       // real status + Content-Range to seek correctly in direct-file streams.
       const outStatus = response.status === 206 ? 206 : 200;
 
-      if (response.body) {
-        return new NextResponse(response.body, {
+      if (outBody) {
+        return new NextResponse(outBody, {
           status: outStatus,
           headers: responseHeaders,
         });
